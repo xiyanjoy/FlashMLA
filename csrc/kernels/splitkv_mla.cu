@@ -1022,7 +1022,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
     int begin_seqlen = tile_scheduler_metadata.y;
     int end_idx = tile_scheduler_metadata.z;
     int end_seqlen = tile_scheduler_metadata.w;
-    if (begin_idx >= params.b) return;
+    if (begin_idx >= params.b || begin_idx < 0) return;
     int begin_n_split_idx = __ldg(tile_scheduler_metadata_ptr + 4);
 
     // Copy the first Q
