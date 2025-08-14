@@ -19,8 +19,7 @@ Currently released:
 ## Requirements
 
 - Hopper GPUs
-- CUDA 12.3 and above
-    - **But we highly recommend 12.8 or above for the best performance**
+- CUDA 12.8 and above
 - PyTorch 2.0 and above
 
 ## Quick start
