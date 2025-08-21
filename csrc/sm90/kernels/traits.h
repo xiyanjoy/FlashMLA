@@ -203,10 +203,8 @@ enum NamedBarriers : int {
     sP0Ready = 2,
     rO1sP0sV0RIssued = 3,
     sMInitialized = 4,
-    sV0LReady = 5,
-    sV0RReady = 6,
-    sV1LReady = 7,
-    sV1RReady = 8,
-    sV0ZeroReady = 9,
-    sV1ZeroReady = 10,
+    sPreV0ZeroReady = 5,
+    sPreV1ZeroReady = 6,
+    sV0ZeroReady = 7,
+    sV1ZeroReady = 8
 };
