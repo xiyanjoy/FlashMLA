@@ -1,5 +1,6 @@
 #pragma once
 
+#include <torch/extension.h>
 #include "cutlass/numeric_types.h"
 #include "helper.h"
 
@@ -36,18 +37,21 @@ struct DeviceAllocation {
   T* ptr_ = nullptr;
   size_t offset_ = 0;
   size_t size_ = 0;
+  torch::Tensor tensor;
 
   DeviceAllocation(DeviceAllocation const&) = delete;
   DeviceAllocation& operator=(DeviceAllocation const&) = delete;
 
   DeviceAllocation() = default;
   DeviceAllocation(size_t size) { reset(size); }
-  ~DeviceAllocation() { reset(); }
+  ~DeviceAllocation() {}
 
   void reset(size_t size, size_t offset=0) {
-    reset();
-    auto ret = cudaMalloc(&ptr_, sizeof(T) * (size + offset));
-    assert(ret == cudaSuccess);
+    size_t num_element = sizeof(T) * (size + offset);
+    auto options = torch::TensorOptions().dtype(torch::kByte).device(torch::kCUDA);
+
+    tensor = torch::empty(num_element, options);
+    ptr_ = tensor.data_ptr<T>();
     size_ = size;
     offset_ = offset;
   }
@@ -60,24 +64,7 @@ struct DeviceAllocation {
     return ptr_ + offset_;
   }
 
-  void reset() {
-    if (ptr_ != nullptr) {
-      auto ret = cudaFree(ptr_);
-      assert(ret == cudaSuccess);
-    }
-  }
-
   size_t size() const { return size_; }
 
   size_t get_storage_size() const { return (size_ + offset_) * sizeof(T); }
-
-  void copy_from_host(const T* ptr, size_t sz) {
-    auto ret = cudaMemcpy(ptr_, ptr, sz * sizeof(T), cudaMemcpyDefault);
-    assert(ret == cudaSuccess);
-  }
-
-  void copy_from_device(const T* ptr, size_t sz) {
-    auto ret = cudaMemcpy(ptr_, ptr, sz * sizeof(T), cudaMemcpyDefault);
-    assert(ret == cudaSuccess);
-  }
 };
