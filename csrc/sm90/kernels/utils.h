@@ -86,6 +86,10 @@ CUTLASS_DEVICE void convert_type_out(Tensor<Engine, Layout> const &tensor, Tenso
     Tensor out_frg = recast<cutlass::Array<To_type, FragmentSize>>(out);
     static_assert(size(frag) == size(out_frg));
     cutlass::NumericArrayConverter<To_type, From_type, FragmentSize> convert_op;
+    float scale = 1.0;
+    if (std::is_same_v<To_type, cutlass::float_e4m3_t>) { scale = 448.0; }
+    #pragma unroll
+    for (int i = 0; i < size(tensor); ++i) { tensor[i] = tensor[i] * scale; }
     #pragma unroll
     for (int i = 0; i < size(frag); ++i) { out_frg[i] = convert_op(frag[i]); }
 }

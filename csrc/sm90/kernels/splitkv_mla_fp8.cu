@@ -568,6 +568,9 @@ CUTLASS_DEVICE void store_o(
     int idx_in_warpgroup
 ) {
     using OutputT = typename T::OutputT;
+    using InputT = typename T::InputT;
+    float scale = 1.0;
+    if (std::is_same_v<InputT, cutlass::float_e4m3_t>) {scale = 448.0;}
     if constexpr (IS_NO_SPLIT) {
         // Should convert the output to bfloat16 / float16, and save it to O
         Tensor sOutputBuf = make_tensor(make_smem_ptr((OutputT*)sO_addr), tile_to_shape(
@@ -578,7 +581,7 @@ CUTLASS_DEVICE void store_o(
         Tensor rOb = make_tensor_like<OutputT>(rO);
         CUTLASS_PRAGMA_UNROLL
         for (int idx = 0; idx < size(rO); ++idx) {
-            rOb(idx) = (OutputT)(rO(idx) / rL[idx%4 >= 2]);
+            rOb(idx) = (OutputT)(rO(idx) / rL[idx%4 >= 2] / scale);
         }
 
         Tensor sMyOutputBuf = local_tile(sOutputBuf, Shape<_64, _256>{}, make_coord(_0{}, warpgroup_idx));
@@ -617,8 +620,8 @@ CUTLASS_DEVICE void store_o(
             int row = (idx_in_warpgroup/32)*16 + (idx_in_warpgroup%32/4) + (idx%4 >= 2 ? 8 : 0);
             int col = warpgroup_idx*256 + (idx_in_warpgroup%4)*2 + idx/4*8;
             *(float2*)((float*)sO_addr + sOutputBuf.layout()(row, col)) = float2 {
-                rO(idx) / rL[idx%4 >= 2],
-                rO(idx+1) / rL[idx%4 >= 2],
+                rO(idx) / rL[idx%4 >= 2] / scale,
+                rO(idx+1) / rL[idx%4 >= 2] / scale,
             };
         }
         cutlass::arch::fence_view_async_shared();
