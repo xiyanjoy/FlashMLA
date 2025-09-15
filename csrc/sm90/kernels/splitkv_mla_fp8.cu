@@ -153,6 +153,7 @@ CUTLASS_DEVICE void qkt_gemm_one_tile_sQ(
     cute::gemm(tiled_mma, thr_mma_sQ_tile(_, _, _1{}), thr_mma_sKV_tile(_, _, _1{}), rP);
     warpgroup_commit_batch();
     warpgroup_fence_operand(rP);
+    // The compiler will add DEPBAR instruction.
 }
 
 
@@ -185,13 +186,23 @@ CUTLASS_DEVICE void warpgroup_cooperative_qkt_gemm(
 ) {
     Tensor sQ_tiled = flat_divide(sQ, Shape<Int<T::BLOCK_SIZE_M>, _64>{})(_, _, _0{}, _);	// (BLOCK_SIZE_M, 64, 9)
     Tensor sKV_tiled = flat_divide(sKV, Shape<Int<T::PAGE_BLOCK_SIZE>, _64>{})(_, _, _0{}, _);	// (PAGE_BLOCK_SIZE, 64, 9)
+    Tensor rPAccume = make_tensor_like(rP);
     TiledMMA tiled_mma_sQ = (typename T::TiledMMA_QK_sQ){};
     ThrMMA thr_mma_sQ = tiled_mma_sQ.get_slice(idx_in_warpgroup);
     Tensor thr_mma_sQ_tiled = thr_mma_sQ.partition_fragment_A(sQ_tiled);	// (MMA, 1, 2, 9)
     Tensor thr_mma_sKV_tiled = thr_mma_sQ.partition_fragment_B(sKV_tiled);	// (MMA, 1, 2, 9)
 
     #define QKT_GEMM_ONE_TILE(TILE_IDX) \
-        qkt_gemm_one_tile_sQ<T>(tiled_mma_sQ, thr_mma_sQ_tiled(_, _, _, Int<TILE_IDX>{}), thr_mma_sKV_tiled(_, _, _, Int<TILE_IDX>{}), rP, sKV.data().get().get(), sVt_ptr, barriers + TILE_IDX, cur_phase, idx_in_warpgroup, TILE_IDX, v_named_barrier, valid_window_size);
+        do { \
+            bool is_first_tile = (tiled_mma_sQ.accumulate_ == GMMA::ScaleOut::Zero); \
+            tiled_mma_sQ.accumulate_ = GMMA::ScaleOut::Zero; \
+            qkt_gemm_one_tile_sQ<T>(tiled_mma_sQ, thr_mma_sQ_tiled(_, _, _, Int<TILE_IDX>{}), thr_mma_sKV_tiled(_, _, _, Int<TILE_IDX>{}), rPAccume, sKV.data().get().get(), sVt_ptr, barriers + TILE_IDX, cur_phase, idx_in_warpgroup, TILE_IDX, v_named_barrier, valid_window_size); \
+            _Pragma("unroll") \
+            for (int i = 0; i < size(rP); ++i) { \
+                rP(i) = is_first_tile ? rPAccume(i): rP(i) + rPAccume(i); \
+            } \
+        } while (0)
+
     if constexpr (PHASE_IDX == 0) {
         // In PHASE-0, warpgroup 0 calculates Q K^T for the first 4 tiles
         tiled_mma_sQ.accumulate_ = GMMA::ScaleOut::Zero;
@@ -237,11 +248,33 @@ CUTLASS_DEVICE void warpgroup_cooperative_qkt_gemm_no_pipeline(
     Tensor<Engine2, Layout2> &rP,	// ((4, 2, 2), 1, 2)
     int idx_in_warpgroup
 ) {
-    TiledMMA tiled_mma = (typename T::TiledMMA_QK_sQ){};
-    ThrMMA thr_mma = tiled_mma.get_slice(idx_in_warpgroup);
-    Tensor thr_mma_sQ = thr_mma.partition_fragment_A(sQ);	// (MMA, 1, 576/32=18)
-    Tensor thr_mma_sKV = thr_mma.partition_fragment_B(sKV);	// (MMA, 1, 576/32=18)
-    gemm<true, -1>(tiled_mma, thr_mma_sQ, thr_mma_sKV, rP);
+    Tensor sQ_tiled = flat_divide(sQ, Shape<Int<T::BLOCK_SIZE_M>, _64>{})(_, _, _0{}, _);	// (BLOCK_SIZE_M, 64, 9)
+    Tensor sKV_tiled = flat_divide(sKV, Shape<Int<T::PAGE_BLOCK_SIZE>, _64>{})(_, _, _0{}, _);	// (PAGE_BLOCK_SIZE, 64, 9)
+    Tensor rPAccume = make_tensor_like(rP);
+    TiledMMA tiled_mma_sQ = (typename T::TiledMMA_QK_sQ){};
+    ThrMMA thr_mma_sQ = tiled_mma_sQ.get_slice(idx_in_warpgroup);
+    Tensor thr_mma_sQ_tiled = thr_mma_sQ.partition_fragment_A(sQ_tiled);	// (MMA, 1, 2, 9)
+    Tensor thr_mma_sKV_tiled = thr_mma_sQ.partition_fragment_B(sKV_tiled);	// (MMA, 1, 2, 9)
+
+    warpgroup_fence_operand(rPAccume);
+    warpgroup_arrive();
+
+    // Unroll the K mode manually to set scale D to 1
+    CUTLASS_PRAGMA_UNROLL
+    for (int k_block = 0; k_block < size<3>(thr_mma_sQ_tiled); ++k_block) {
+        tiled_mma_sQ.accumulate_ = GMMA::ScaleOut::Zero;
+        cute::gemm(tiled_mma_sQ, thr_mma_sQ_tiled(_,_,0,k_block), thr_mma_sKV_tiled(_,_,0,k_block), rPAccume);
+        tiled_mma_sQ.accumulate_ = GMMA::ScaleOut::One;
+        cute::gemm(tiled_mma_sQ, thr_mma_sQ_tiled(_,_,1,k_block), thr_mma_sKV_tiled(_,_,1,k_block), rPAccume);
+        warpgroup_commit_batch();
+        warpgroup_fence_operand(rPAccume);
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(rP); ++i) {
+            rP(i) = (k_block == 0) ? rPAccume(i): rP(i) + rPAccume(i);
+        }
+    }
+
 }
 
 
