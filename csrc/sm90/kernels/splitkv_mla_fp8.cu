@@ -704,6 +704,8 @@ template<
     typename Engine1, typename Layout1,
     typename Engine2, typename Layout2,
     typename Engine3, typename Layout3,
+    typename Engine4, typename Layout4,
+    typename Engine5, typename Layout5,
     typename Engine6, typename Layout6,
     typename Engine7, typename Layout7,
     typename Engine8, typename Layout8,
@@ -717,8 +719,8 @@ CUTLASS_DEVICE void wg0_subroutine(
     Tensor<Engine1, Layout1> &sQ,
     Tensor<Engine2, Layout2> &sK0,
     Tensor<Engine3, Layout3> &sK1,
-    uint16_t* sP0_ptr,
-    uint16_t* sP1_ptr,
+    Tensor<Engine4, Layout4> &sP0,
+    Tensor<Engine5, Layout5> &sP1,
     Tensor<Engine6, Layout6> &sM,
     Tensor<Engine7, Layout7> &sScale0,
     Tensor<Engine8, Layout8> &sScale1,
@@ -778,7 +780,7 @@ CUTLASS_DEVICE void wg0_subroutine(
         launch_kv_tiles_copy_tma<0, 4>(tma_gK(_, _, nxt_block0_index), sK0, tma_params.tma_K, barriers_K0, idx_in_warpgroup);
     }
     wg0_scale_rP0<T>(sScale1, rP0, rPb, idx_in_warpgroup);
-    save_rPb_to_sP<T>(rPb, sP0_ptr, idx_in_warpgroup);
+    save_rPb_to_sP<T>(rPb, reinterpret_cast<uint16_t*>(sP0.data().get().get()), idx_in_warpgroup);
     cutlass::arch::fence_view_async_shared();
     NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sP0Ready);
     
@@ -787,7 +789,7 @@ CUTLASS_DEVICE void wg0_subroutine(
         NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::rO1sP0sV0RIssued);
         wg0_rescale_rO0(rO0, sScale1, rL, idx_in_warpgroup);
         //warpgroup_cooperative_pv_gemm_remoteP<T>(sP1, sV1L, rO0, idx_in_warpgroup); // replace
-        load_sP_to_rPb<T>(sP1_ptr, rPb, idx_in_warpgroup);
+        load_sP_to_rPb<T>(reinterpret_cast<uint16_t*>(sP1.data().get().get()), rPb, idx_in_warpgroup);
         warpgroup_cooperative_pv_gemm_localP<T>(rPb, sV1L, rO0, idx_in_warpgroup);
     }
     
@@ -823,6 +825,8 @@ template<
     typename Engine1, typename Layout1,
     typename Engine2, typename Layout2,
     typename Engine3, typename Layout3,
+    typename Engine4, typename Layout4,
+    typename Engine5, typename Layout5,
     typename Engine6, typename Layout6,
     typename Engine7, typename Layout7,
     typename Engine8, typename Layout8,
@@ -836,8 +840,8 @@ CUTLASS_DEVICE void wg1_subroutine(
     Tensor<Engine1, Layout1> &sQ,
     Tensor<Engine2, Layout2> &sK0,
     Tensor<Engine3, Layout3> &sK1,
-    uint16_t* sP0_ptr,
-    uint16_t* sP1_ptr,
+    Tensor<Engine4, Layout4> &sP0,
+    Tensor<Engine5, Layout5> &sP1,
     Tensor<Engine6, Layout6> &sM,
     Tensor<Engine7, Layout7> &sScale0,
     Tensor<Engine8, Layout8> &sScale1,
@@ -885,7 +889,7 @@ CUTLASS_DEVICE void wg1_subroutine(
     // Save rPb to sP, and issue rO1 += rP1b @ sV1R
     // We do this after notifying warpgroup 1, since both "saving rPb to sP" and "issuing" WGMMA are high-latency operations
     if constexpr (!IS_BLK0_LAST) {
-        save_rPb_to_sP<T>(rP1b, sP1_ptr, idx_in_warpgroup);
+        save_rPb_to_sP<T>(rP1b, reinterpret_cast<uint16_t*>(sP1.data().get().get()), idx_in_warpgroup);
     }
     if constexpr (!IS_BLK0_LAST) {
         warpgroup_cooperative_pv_gemm_localP<T>(rP1b, sV1R, rO1, idx_in_warpgroup);
@@ -900,7 +904,7 @@ CUTLASS_DEVICE void wg1_subroutine(
     NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sP0Ready);
 
     //warpgroup_cooperative_pv_gemm_remoteP<T>(sP0, sV0R, rO1, idx_in_warpgroup); // replace
-    load_sP_to_rPb<T>(sP0_ptr, rP1b, idx_in_warpgroup);
+    load_sP_to_rPb<T>(reinterpret_cast<uint16_t*>(sP0.data().get().get()), rP1b, idx_in_warpgroup);
     warpgroup_cooperative_pv_gemm_localP<T>(rP1b, sV0R, rO1, idx_in_warpgroup);
     if constexpr (!IS_BLK0_LAST) {
         NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::rO1sP0sV0RIssued);
@@ -971,8 +975,8 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
     Tensor sQ = make_tensor(make_smem_ptr(plan.smem_sQ), (typename T::SmemLayoutQ){});
     Tensor sK0 = make_tensor(make_smem_ptr(reinterpret_cast<typename T::InputT*>(plan.smem_sK0)), (typename T::SmemLayoutK){});
     Tensor sK1 = make_tensor(make_smem_ptr(reinterpret_cast<typename T::InputT*>(plan.smem_sK1)), (typename T::SmemLayoutK){});
-    //Tensor sP0 = make_tensor(make_smem_ptr(reinterpret_cast<typename T::InputT*>(plan.smem_sP0.data())), (typename T::SmemLayoutP0){});
-    //Tensor sP1 = make_tensor(make_smem_ptr(reinterpret_cast<typename T::InputT*>(plan.smem_sP1.data())), (typename T::SmemLayoutP0){});
+    Tensor sP0 = make_tensor(make_smem_ptr(reinterpret_cast<typename T::InputT*>(plan.smem_sP0)), (typename T::SmemLayoutP0){});
+    Tensor sP1 = make_tensor(make_smem_ptr(reinterpret_cast<typename T::InputT*>(plan.smem_sP1)), (typename T::SmemLayoutP0){});
     Tensor sM = make_tensor(make_smem_ptr(plan.smem_sM.data()), make_shape(Int<T::BLOCK_SIZE_M>{}));
 
     using Fp8Trans = SmemTransposeFp8_64x64<T::PAGE_BLOCK_SIZE, T::HEAD_DIM_V>;
@@ -1139,7 +1143,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
 
             #define LAUNCH_WG0_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST) \
                 wg0_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST>( \
-                    tma_gK, sQ, sK0, sK1, plan.smem_sP0, plan.smem_sP1, sM, sScale0, sScale1, \
+                    tma_gK, sQ, sK0, sK1, sP0, sP1, sM, sScale0, sScale1, \
                     rP0, rO, sV0, sV1, sVt0_ptr, rL, rRightBorderForQSeq, \
                     barriers_K0, barriers_K1, cur_phase_K0, \
                     tma_params, params, \
@@ -1170,7 +1174,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
 
             #define LAUNCH_WG1_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST) \
                 wg1_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST>( \
-                    tma_gK, sQ, sK0, sK1, plan.smem_sP0, plan.smem_sP1, sM, sScale0, sScale1, \
+                    tma_gK, sQ, sK0, sK1, sP0, sP1, sM, sScale0, sScale1, \
                     rP1, rO, sV0, sV1, sVt1_ptr, rL, rRightBorderForQSeq, \
                     barriers_K0, barriers_K1, cur_phase_K1, \
                     tma_params, params, \
