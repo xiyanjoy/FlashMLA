@@ -197,10 +197,7 @@ CUTLASS_DEVICE void warpgroup_cooperative_qkt_gemm(
             bool is_first_tile = (tiled_mma_sQ.accumulate_ == GMMA::ScaleOut::Zero); \
             tiled_mma_sQ.accumulate_ = GMMA::ScaleOut::Zero; \
             qkt_gemm_one_tile_sQ<T>(tiled_mma_sQ, thr_mma_sQ_tiled(_, _, _, Int<TILE_IDX>{}), thr_mma_sKV_tiled(_, _, _, Int<TILE_IDX>{}), rPAccume, sKV.data().get().get(), sVt_ptr, barriers + TILE_IDX, cur_phase, idx_in_warpgroup, TILE_IDX, v_named_barrier, valid_window_size); \
-            _Pragma("unroll") \
-            for (int i = 0; i < size(rP); ++i) { \
-                rP(i) = is_first_tile ? rPAccume(i): rP(i) + rPAccume(i); \
-            } \
+            cute::axpby(1, rPAccume, is_first_tile? 0: 1, rP); \
         } while (0)
 
     if constexpr (PHASE_IDX == 0) {
@@ -269,10 +266,7 @@ CUTLASS_DEVICE void warpgroup_cooperative_qkt_gemm_no_pipeline(
         warpgroup_commit_batch();
         warpgroup_fence_operand(rPAccume);
 
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < size(rP); ++i) {
-            rP(i) = (k_block == 0) ? rPAccume(i): rP(i) + rPAccume(i);
-        }
+        cute::axpby(1, rPAccume, (k_block == 0)? 0: 1, rP);
     }
 
 }
