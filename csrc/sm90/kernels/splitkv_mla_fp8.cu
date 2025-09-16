@@ -472,7 +472,7 @@ template<
     typename T,
     typename Engine0, typename Layout0
 >
-CUTLASS_DEVICE void save_rPb_to_sP(
+CUTLASS_DEVICE void save_rPb_to_sP_(
     Tensor<Engine0, Layout0> &rPb,
     uint16_t* sP_ptr,
     int idx_in_warpgroup
@@ -497,9 +497,33 @@ CUTLASS_DEVICE void save_rPb_to_sP(
 
 template<
     typename T,
+    typename Engine0, typename Layout0,
+    typename Engine1, typename Layout1
+>
+CUTLASS_DEVICE void save_rPb_to_sP(
+    Tensor<Engine0, Layout0> &rPb,
+    Tensor<Engine1, Layout1> &sP,
+    int idx_in_warpgroup
+) {
+    auto r2s_copy = make_tiled_copy_A(
+        Copy_Atom<SM90_U32x4_STSM_N, typename T::InputT>{},
+        (typename T::TiledMMA_PV_LocalP){}
+    );
+    ThrCopy thr_copy = r2s_copy.get_slice(idx_in_warpgroup);
+    Tensor thr_copy_rPb = thr_copy.retile_S(rPb);
+    Tensor thr_copy_sP = thr_copy.partition_D(sP);
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size<2>(thr_copy_rPb); ++i) {
+        cute::copy(r2s_copy, thr_copy_rPb(_, _, i), thr_copy_sP(_, _, i));
+    }
+}
+
+
+template<
+    typename T,
     typename Engine0, typename Layout0
 >
-CUTLASS_DEVICE void load_sP_to_rPb(
+CUTLASS_DEVICE void load_sP_to_rPb_(
     uint16_t* sP_ptr,
     Tensor<Engine0, Layout0> &rPb,
     int idx_in_warpgroup
@@ -519,6 +543,30 @@ CUTLASS_DEVICE void load_sP_to_rPb(
     Tensor sPi1_tile = thr_w.partition_S(sPi1);  
     Tensor tXrXi1 = make_tensor(make_rmem_ptr(reinterpret_cast<uint16_t*>(rPb.data()) + 8), typename T::RegLayout{}); 
     copy(copy_s2r, sPi1_tile, tXrXi1);  
+}
+
+
+template<
+    typename T,
+    typename Engine0, typename Layout0,
+    typename Engine1, typename Layout1
+>
+CUTLASS_DEVICE void load_sP_to_rPb(
+    Tensor<Engine0, Layout0> &sP,
+    Tensor<Engine1, Layout1> &rPb,
+    int idx_in_warpgroup
+) {
+    auto s2r_copy = make_tiled_copy_A(
+        Copy_Atom<SM75_U32x4_LDSM_N, typename T::InputT>{},
+        (typename T::TiledMMA_PV_LocalP){}
+    );
+    ThrCopy thr_copy = s2r_copy.get_slice(idx_in_warpgroup);
+    Tensor thr_copy_sP = thr_copy.partition_S(sP);
+    Tensor thr_copy_rPb = thr_copy.retile_D(rPb);
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size<2>(thr_copy_rPb); ++i) {
+        cute::copy(s2r_copy, thr_copy_sP(_, _, i), thr_copy_rPb(_, _, i));
+    }
 }
 
 
@@ -780,7 +828,7 @@ CUTLASS_DEVICE void wg0_subroutine(
         launch_kv_tiles_copy_tma<0, 4>(tma_gK(_, _, nxt_block0_index), sK0, tma_params.tma_K, barriers_K0, idx_in_warpgroup);
     }
     wg0_scale_rP0<T>(sScale1, rP0, rPb, idx_in_warpgroup);
-    save_rPb_to_sP<T>(rPb, reinterpret_cast<uint16_t*>(sP0.data().get().get()), idx_in_warpgroup);
+    save_rPb_to_sP<T>(rPb, sP0, idx_in_warpgroup);
     cutlass::arch::fence_view_async_shared();
     NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sP0Ready);
     
@@ -788,9 +836,9 @@ CUTLASS_DEVICE void wg0_subroutine(
     if constexpr (!IS_BLK0_LAST) {
         NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::rO1sP0sV0RIssued);
         wg0_rescale_rO0(rO0, sScale1, rL, idx_in_warpgroup);
-        //warpgroup_cooperative_pv_gemm_remoteP<T>(sP1, sV1L, rO0, idx_in_warpgroup); // replace
-        load_sP_to_rPb<T>(reinterpret_cast<uint16_t*>(sP1.data().get().get()), rPb, idx_in_warpgroup);
-        warpgroup_cooperative_pv_gemm_localP<T>(rPb, sV1L, rO0, idx_in_warpgroup);
+        warpgroup_cooperative_pv_gemm_remoteP<T>(sP1, sV1L, rO0, idx_in_warpgroup);
+        // load_sP_to_rPb<T>(sP1, rPb, idx_in_warpgroup);
+        // warpgroup_cooperative_pv_gemm_localP<T>(rPb, sV1L, rO0, idx_in_warpgroup);
     }
     
     // Issue P0 = Q @ K0^T
@@ -889,7 +937,7 @@ CUTLASS_DEVICE void wg1_subroutine(
     // Save rPb to sP, and issue rO1 += rP1b @ sV1R
     // We do this after notifying warpgroup 1, since both "saving rPb to sP" and "issuing" WGMMA are high-latency operations
     if constexpr (!IS_BLK0_LAST) {
-        save_rPb_to_sP<T>(rP1b, reinterpret_cast<uint16_t*>(sP1.data().get().get()), idx_in_warpgroup);
+        save_rPb_to_sP<T>(rP1b, sP1, idx_in_warpgroup);
     }
     if constexpr (!IS_BLK0_LAST) {
         warpgroup_cooperative_pv_gemm_localP<T>(rP1b, sV1R, rO1, idx_in_warpgroup);
@@ -903,9 +951,9 @@ CUTLASS_DEVICE void wg1_subroutine(
     // Wait for sP0, issue rO1 += sP0 @ sV0R, notify warpgroup 0
     NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sP0Ready);
 
-    //warpgroup_cooperative_pv_gemm_remoteP<T>(sP0, sV0R, rO1, idx_in_warpgroup); // replace
-    load_sP_to_rPb<T>(reinterpret_cast<uint16_t*>(sP0.data().get().get()), rP1b, idx_in_warpgroup);
-    warpgroup_cooperative_pv_gemm_localP<T>(rP1b, sV0R, rO1, idx_in_warpgroup);
+    warpgroup_cooperative_pv_gemm_remoteP<T>(sP0, sV0R, rO1, idx_in_warpgroup);
+    // load_sP_to_rPb<T>(sP0, rP1b, idx_in_warpgroup);
+    // warpgroup_cooperative_pv_gemm_localP<T>(rP1b, sV0R, rO1, idx_in_warpgroup);
     if constexpr (!IS_BLK0_LAST) {
         NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::rO1sP0sV0RIssued);
     }

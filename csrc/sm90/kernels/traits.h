@@ -149,7 +149,7 @@ struct TraitsFP8 {
              make_layout(Shape<Int<HEAD_DIM_V>,Int<PAGE_BLOCK_SIZE>>{},GenRowMajor{})));
 
     using SmemLayoutP0 = decltype(tile_to_shape(
-        get_smem_layoutK<InputT,HEAD_DIM_K>(),
+        get_smem_layoutK<InputT,PAGE_BLOCK_SIZE>(),
         Shape<Int<BLOCK_SIZE_M>, Int<PAGE_BLOCK_SIZE>>{}
     ));
 
