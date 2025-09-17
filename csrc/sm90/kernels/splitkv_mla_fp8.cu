@@ -292,7 +292,9 @@ CUTLASS_DEVICE void warpgroup_cooperative_pv_gemm_localP(
         Stride<Stride<_1, _4, _8>, _0, _16>
     >{});
     Tensor thr_mma_sKV_half = thr_mma.partition_fragment_B(sKV_half);	// (MMA, 1, 64/32=2)
-    gemm<false, -1>(tiled_mma, rP_retiled, thr_mma_sKV_half, rO);
+    Tensor rOAccume = make_tensor_like(rO);
+    gemm<true, -1>(tiled_mma, rP_retiled, thr_mma_sKV_half, rOAccume);
+    cute::axpby(1, rOAccume, 1, rO);
 }
 
 // Compute O += PV, where P resides in shared memory
@@ -312,8 +314,9 @@ CUTLASS_DEVICE void warpgroup_cooperative_pv_gemm_remoteP(
     ThrMMA thr_mma = tiled_mma.get_slice(idx_in_warpgroup);
     Tensor thr_mma_sP = thr_mma.partition_fragment_A(sP);
     Tensor thr_mma_sKV_half = thr_mma.partition_fragment_B(sKV_half);	// (MMA, 1, 64/32=2)
-
-    gemm<false, -1>(tiled_mma, thr_mma_sP, thr_mma_sKV_half, rO);
+    Tensor rOAccume = make_tensor_like(rO);
+    gemm<true, -1>(tiled_mma, thr_mma_sP, thr_mma_sKV_half, rOAccume);
+    cute::axpby(1, rOAccume, 1, rO);
 }
 
 
