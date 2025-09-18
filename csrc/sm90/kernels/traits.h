@@ -172,6 +172,7 @@ struct TraitsFP8 {
         alignas(16) InputT smem_vt1[PAGE_BLOCK_SIZE * HEAD_DIM_V]; // overlap Sout
         alignas(16) uint16_t smem_sP0[64 * 32];
         alignas(16) uint16_t smem_sP1[64 * 32];
+        alignas(16) float smem_sDescaleQ[BLOCK_SIZE_M * 9];
 
         cute::array_aligned<float, BLOCK_SIZE_M> smem_sM;
         cute::array_aligned<float, 2*BLOCK_SIZE_M> sL_reduction_wksp;
