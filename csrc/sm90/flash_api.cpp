@@ -129,7 +129,7 @@ mha_fwd_kvcache_mla(
         TORCH_CHECK(descale_q_value.dtype() == torch::kFloat);
         TORCH_CHECK(descale_k_value.dtype() == torch::kFloat);
         CHECK_SHAPE(descale_q_value, batch_size, seqlen_q_ori, num_heads_q, int(head_size_k / 64));
-        CHECK_SHAPE(descale_k_value, 1);
+        CHECK_SHAPE(descale_k_value, int(head_size_k / 64));
     }
 
     if (seqlen_q_ori == 1) { is_causal = false; }

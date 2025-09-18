@@ -172,13 +172,15 @@ template<
     typename Engine0, typename Layout0,
     typename Engine1, typename Layout1,
     typename Engine2, typename Layout2,
-    typename Engine3, typename Layout3
+    typename Engine3, typename Layout3,
+    typename Engine4, typename Layout4
 > 
 CUTLASS_DEVICE void warpgroup_cooperative_qkt_gemm(
     Tensor<Engine0, Layout0> &sQ,	// (BLOCK_SIZE_M, HEAD_DIM_K)
     Tensor<Engine1, Layout1> &sKV,	// (PAGE_BLOCK_SIZE, HEAD_DIM_K)
     Tensor<Engine2, Layout2> &rP,	// (_2,_2,_8),_1,_1)
     Tensor<Engine3, Layout3> &s_descale_q,  // (BLOCK_SIZE_M, 9)
+    Tensor<Engine4, Layout4> &g_descale_k,  // (9)
     typename T::InputT* sVt_ptr,
     TMABarrier* barriers,
     bool &cur_phase,
@@ -204,7 +206,7 @@ CUTLASS_DEVICE void warpgroup_cooperative_qkt_gemm(
             _Pragma("unroll") \
             for (int reg_id = 0; reg_id < size<0, 1>(rPAccume); ++reg_id) { \
                 cute::axpby( \
-                    s_descale_q(warp_id * 16 + reg_id * 8 + lane_id / 4, TILE_IDX), \
+                    s_descale_q(warp_id * 16 + reg_id * 8 + lane_id / 4, TILE_IDX) * g_descale_k(TILE_IDX), \
                     rPAccume(make_coord(_, reg_id, _), _, _), \
                     0, \
                     rPAccume(make_coord(_, reg_id, _), _, _) \
@@ -251,13 +253,15 @@ template<
     typename Engine0, typename Layout0,
     typename Engine1, typename Layout1,
     typename Engine2, typename Layout2,
-    typename Engine3, typename Layout3
+    typename Engine3, typename Layout3,
+    typename Engine4, typename Layout4
 > 
 CUTLASS_DEVICE void warpgroup_cooperative_qkt_gemm_no_pipeline(
     Tensor<Engine0, Layout0> &sQ,	// (BLOCK_SIZE_M, HEAD_DIM_K)
     Tensor<Engine1, Layout1> &sKV,	// (BLOCK_SIZE_M, HEAD_DIM_K)
     Tensor<Engine2, Layout2> &rP,	// (_2,_2,_8),_1,_1)
     Tensor<Engine3, Layout3> &s_descale_q,  // (BLOCK_SIZE_M, 9)
+    Tensor<Engine4, Layout4> &g_descale_k,  // (9)
     int idx_in_warpgroup
 ) {
     int warp_id = idx_in_warpgroup / 32;
@@ -286,7 +290,7 @@ CUTLASS_DEVICE void warpgroup_cooperative_qkt_gemm_no_pipeline(
         CUTLASS_PRAGMA_UNROLL
         for (int reg_id = 0; reg_id < size<0, 1>(rPAccume); ++reg_id) {
             cute::axpby(
-                s_descale_q(warp_id * 16 + reg_id * 8 + lane_id / 4, k_block),
+                s_descale_q(warp_id * 16 + reg_id * 8 + lane_id / 4, k_block) * g_descale_k(k_block),
                 rPAccume(make_coord(_, reg_id, _), _, _),
                 0,
                 rPAccume(make_coord(_, reg_id, _), _, _)
@@ -303,12 +307,14 @@ template<
     typename T,
     typename Engine0, typename Layout0,
     typename Engine1, typename Layout1,
-    typename Engine2, typename Layout2
+    typename Engine2, typename Layout2,
+    typename Engine3, typename Layout3
 > 
 CUTLASS_DEVICE void warpgroup_cooperative_pv_gemm_localP(
     Tensor<Engine0, Layout0> &rP,	// ((4, 2, 2), 1, 2), fragment A layout
     Tensor<Engine1, Layout1> &sKV_half,	// (HEAD_DIM_V/2, PAGE_BLOCK_SIZE)
     Tensor<Engine2, Layout2> &rO,	// ((2, 2, 32), 1, 1)
+    Tensor<Engine3, Layout3> g_descale_k,  // (9)
     int idx_in_warpgroup
 ) {
     TiledMMA tiled_mma = (typename T::TiledMMA_PV_LocalP){};
@@ -320,7 +326,12 @@ CUTLASS_DEVICE void warpgroup_cooperative_pv_gemm_localP(
     Tensor thr_mma_sKV_half = thr_mma.partition_fragment_B(sKV_half);	// (MMA, 1, 64/32=2)
     Tensor rOAccume = make_tensor_like(rO);
     gemm<true, -1>(tiled_mma, rP_retiled, thr_mma_sKV_half, rOAccume);
-    cute::axpby(1, rOAccume, 1, rO);
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size<0, 2>(rO); ++i) {
+        int idx = i / 8;
+        cute::axpby(g_descale_k(idx), rOAccume(make_coord(_, _, i), _, _), 1, rO(make_coord(_, _, i), _, _));
+    }
 }
 
 // Compute O += PV, where P resides in shared memory
@@ -328,12 +339,14 @@ template<
     typename T,
     typename Engine0, typename Layout0,
     typename Engine1, typename Layout1,
-    typename Engine2, typename Layout2
+    typename Engine2, typename Layout2,
+    typename Engine3, typename Layout3
 > 
 CUTLASS_DEVICE void warpgroup_cooperative_pv_gemm_remoteP(
     Tensor<Engine0, Layout0> &sP,
     Tensor<Engine1, Layout1> &sKV_half,	// (HEAD_DIM_V/2, PAGE_BLOCK_SIZE)
     Tensor<Engine2, Layout2> &rO,	// ((2, 2, 32), 1, 1)
+    Tensor<Engine3, Layout3> g_descale_k,  // (9)
     int idx_in_warpgroup
 ) {
     TiledMMA tiled_mma = (typename T::TiledMMA_PV_RemoteP){};
@@ -342,7 +355,12 @@ CUTLASS_DEVICE void warpgroup_cooperative_pv_gemm_remoteP(
     Tensor thr_mma_sKV_half = thr_mma.partition_fragment_B(sKV_half);	// (MMA, 1, 64/32=2)
     Tensor rOAccume = make_tensor_like(rO);
     gemm<true, -1>(tiled_mma, thr_mma_sP, thr_mma_sKV_half, rOAccume);
-    cute::axpby(1, rOAccume, 1, rO);
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size<0, 2>(rO); ++i) {
+        int idx = i / 8;
+        cute::axpby(g_descale_k(idx), rOAccume(make_coord(_, _, i), _, _), 1, rO(make_coord(_, _, i), _, _));
+    }
 }
 
 
@@ -790,7 +808,8 @@ template<
     typename Engine11, typename Layout11,
     typename Engine12, typename Layout12,
     typename Engine13, typename Layout13,
-    typename Engine14, typename Layout14
+    typename Engine14, typename Layout14,
+    typename Engine15, typename Layout15
 >
 CUTLASS_DEVICE void wg0_subroutine(
     Tensor<Engine0, Layout0> &tma_gK,
@@ -807,6 +826,7 @@ CUTLASS_DEVICE void wg0_subroutine(
     Tensor<Engine12, Layout12> &sV0,    
     Tensor<Engine13, Layout13> &sV1,
     Tensor<Engine14, Layout14> &s_descale_q,
+    Tensor<Engine15, Layout15> &g_descale_k,
     typename T::InputT* sVt0_ptr,
     float rL[2],
     int rRightBorderForQSeq[2],
@@ -847,7 +867,7 @@ CUTLASS_DEVICE void wg0_subroutine(
     convert_type_out(tOrP_acc, rPb);
 
     // Issue rO0 += rPb @ sV0L
-    warpgroup_cooperative_pv_gemm_localP<T>(rPb, sV0L, rO0, idx_in_warpgroup);
+    warpgroup_cooperative_pv_gemm_localP<T>(rPb, sV0L, rO0, g_descale_k, idx_in_warpgroup);
 
     // Wait for rO0, launch TMA for the next V0L
     cute::warpgroup_wait<0>();
@@ -867,7 +887,7 @@ CUTLASS_DEVICE void wg0_subroutine(
     if constexpr (!IS_BLK0_LAST) {
         NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::rO1sP0sV0RIssued);
         wg0_rescale_rO0(rO0, sScale1, rL, idx_in_warpgroup);
-        warpgroup_cooperative_pv_gemm_remoteP<T>(sP1, sV1L, rO0, idx_in_warpgroup);
+        warpgroup_cooperative_pv_gemm_remoteP<T>(sP1, sV1L, rO0, g_descale_k, idx_in_warpgroup);
         // load_sP_to_rPb<T>(sP1, rPb, idx_in_warpgroup);
         // warpgroup_cooperative_pv_gemm_localP<T>(rPb, sV1L, rO0, idx_in_warpgroup);
     }
@@ -875,7 +895,7 @@ CUTLASS_DEVICE void wg0_subroutine(
     // Issue P0 = Q @ K0^T
     // Since TMAs for these 4 tiles are launched right after rO0 += rPb @ sV0L finishes, they should have already finished. Therefore, we issue the first 4 tiles to fill the pipeline.
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
-        warpgroup_cooperative_qkt_gemm<T, 0, 0>(sQ, sK0, rP0, s_descale_q, sVt0_ptr, barriers_K0, cur_phase_K0, idx_in_warpgroup, NamedBarriers::sV0ZeroReady, seqlen_k - (block_idx + 2) * T::PAGE_BLOCK_SIZE);
+        warpgroup_cooperative_qkt_gemm<T, 0, 0>(sQ, sK0, rP0, s_descale_q, g_descale_k, sVt0_ptr, barriers_K0, cur_phase_K0, idx_in_warpgroup, NamedBarriers::sV0ZeroReady, seqlen_k - (block_idx + 2) * T::PAGE_BLOCK_SIZE);
     }
 
     // Wait for rO0 += rPb @ sV1L, launch TMA
@@ -886,7 +906,7 @@ CUTLASS_DEVICE void wg0_subroutine(
     
     // Issue P0 = Q @ K0^T
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
-        warpgroup_cooperative_qkt_gemm<T, 2, 0>(sQ, sK0, rP0, s_descale_q, sVt0_ptr, barriers_K0, cur_phase_K0, idx_in_warpgroup, NamedBarriers::sV0ZeroReady, seqlen_k - (block_idx + 2) * T::PAGE_BLOCK_SIZE);
+        warpgroup_cooperative_qkt_gemm<T, 2, 0>(sQ, sK0, rP0, s_descale_q, g_descale_k, sVt0_ptr, barriers_K0, cur_phase_K0, idx_in_warpgroup, NamedBarriers::sV0ZeroReady, seqlen_k - (block_idx + 2) * T::PAGE_BLOCK_SIZE);
     }
 
     // Wait for P0 = Q @ K0^T
@@ -913,7 +933,8 @@ template<
     typename Engine11, typename Layout11,
     typename Engine12, typename Layout12,
     typename Engine13, typename Layout13,
-    typename Engine14, typename Layout14
+    typename Engine14, typename Layout14,
+    typename Engine15, typename Layout15
 >
 CUTLASS_DEVICE void wg1_subroutine(
     Tensor<Engine0, Layout0> &tma_gK,
@@ -930,6 +951,7 @@ CUTLASS_DEVICE void wg1_subroutine(
     Tensor<Engine12, Layout12> &sV0,
     Tensor<Engine13, Layout13> &sV1,
     Tensor<Engine14, Layout14> &s_descale_q,
+    Tensor<Engine15, Layout15> &g_descale_k,
     typename T::InputT* sVt1_ptr,
     float rL[2],
     int rRightBorderForQSeq[2],
@@ -973,7 +995,7 @@ CUTLASS_DEVICE void wg1_subroutine(
         save_rPb_to_sP<T>(rP1b, sP1, idx_in_warpgroup);
     }
     if constexpr (!IS_BLK0_LAST) {
-        warpgroup_cooperative_pv_gemm_localP<T>(rP1b, sV1R, rO1, idx_in_warpgroup);
+        warpgroup_cooperative_pv_gemm_localP<T>(rP1b, sV1R, rO1, g_descale_k, idx_in_warpgroup);
         if constexpr (!IS_BLK1_LAST) {
             // We use this proxy for making sP1 visible to the async proxy
             // We skip it if IS_BLK1_LAST, since in that case we have already put a fence
@@ -984,7 +1006,7 @@ CUTLASS_DEVICE void wg1_subroutine(
     // Wait for sP0, issue rO1 += sP0 @ sV0R, notify warpgroup 0
     NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sP0Ready);
 
-    warpgroup_cooperative_pv_gemm_remoteP<T>(sP0, sV0R, rO1, idx_in_warpgroup);
+    warpgroup_cooperative_pv_gemm_remoteP<T>(sP0, sV0R, rO1, g_descale_k, idx_in_warpgroup);
     // load_sP_to_rPb<T>(sP0, rP1b, idx_in_warpgroup);
     // warpgroup_cooperative_pv_gemm_localP<T>(rP1b, sV0R, rO1, idx_in_warpgroup);
     if constexpr (!IS_BLK0_LAST) {
@@ -1005,7 +1027,7 @@ CUTLASS_DEVICE void wg1_subroutine(
 
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST && !IS_BLK2_LAST) {
         // Issue rP1 = sQ @ sK1, wait
-        warpgroup_cooperative_qkt_gemm<T, 1, 1>(sQ, sK1, rP1, s_descale_q, sVt1_ptr, barriers_K1, cur_phase_K1, idx_in_warpgroup, NamedBarriers::sV1ZeroReady, seqlen_k - (block_idx + 3) * T::PAGE_BLOCK_SIZE);
+        warpgroup_cooperative_qkt_gemm<T, 1, 1>(sQ, sK1, rP1, s_descale_q, g_descale_k, sVt1_ptr, barriers_K1, cur_phase_K1, idx_in_warpgroup, NamedBarriers::sV1ZeroReady, seqlen_k - (block_idx + 3) * T::PAGE_BLOCK_SIZE);
     }
 
     // We put the `cute::warpgroup_wait<0>()` out of the `if` statement above, otherwise
@@ -1074,6 +1096,12 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
             params.h_q / params.h_k * 9,
             Int<9>{},
             Int<1>{}
+        )
+    );
+    Tensor g_descale_k = make_tensor(
+        make_gmem_ptr(params.descale_k_ptr),
+        make_shape(
+            Int<9>{}
         )
     );
     Tensor s_descale_q = make_tensor(
@@ -1250,7 +1278,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
             }
             cur_phase_K0 ^= 1;
             // Issue P0 = Q @ K0^T, wait
-            warpgroup_cooperative_qkt_gemm_no_pipeline<T>(sQ, sK0, rP0, s_descale_q, idx_in_warpgroup);
+            warpgroup_cooperative_qkt_gemm_no_pipeline<T>(sQ, sK0, rP0, s_descale_q, g_descale_k, idx_in_warpgroup);
             // We add a barrier here, making sure that previous writes to sM are visible to warpgroup 0
             NamedBarrier::arrive_and_wait(128, NamedBarriers::sMInitialized);
             cute::warpgroup_wait<0>();
@@ -1258,7 +1286,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
             #define LAUNCH_WG0_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST) \
                 wg0_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST>( \
                     tma_gK, sQ, sK0, sK1, sP0, sP1, sM, sScale0, sScale1, \
-                    rP0, rO, sV0, sV1, s_descale_q, sVt0_ptr, rL, rRightBorderForQSeq, \
+                    rP0, rO, sV0, sV1, s_descale_q, g_descale_k, sVt0_ptr, rL, rRightBorderForQSeq, \
                     barriers_K0, barriers_K1, cur_phase_K0, \
                     tma_params, params, \
                     block_table_ptr, seqlen_k, block_idx, end_block_idx, idx_in_warpgroup \
@@ -1282,14 +1310,14 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
             
             if (start_block_idx+1 < end_block_idx) {
                 // Issue rP1 = sQ @ sK1, wait
-                warpgroup_cooperative_qkt_gemm<T, 1, 1>(sQ, sK1, rP1, s_descale_q, sVt1_ptr, barriers_K1, cur_phase_K1, idx_in_warpgroup, NamedBarriers::sPreV1ZeroReady, seqlen_k - (start_block_idx+1) * T::PAGE_BLOCK_SIZE);
+                warpgroup_cooperative_qkt_gemm<T, 1, 1>(sQ, sK1, rP1, s_descale_q, g_descale_k, sVt1_ptr, barriers_K1, cur_phase_K1, idx_in_warpgroup, NamedBarriers::sPreV1ZeroReady, seqlen_k - (start_block_idx+1) * T::PAGE_BLOCK_SIZE);
                 cute::warpgroup_wait<0>();
             }
 
             #define LAUNCH_WG1_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST) \
                 wg1_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST>( \
                     tma_gK, sQ, sK0, sK1, sP0, sP1, sM, sScale0, sScale1, \
-                    rP1, rO, sV0, sV1, s_descale_q, sVt1_ptr, rL, rRightBorderForQSeq, \
+                    rP1, rO, sV0, sV1, s_descale_q, g_descale_k, sVt1_ptr, rL, rRightBorderForQSeq, \
                     barriers_K0, barriers_K1, cur_phase_K1, \
                     tma_params, params, \
                     block_table_ptr, seqlen_k, block_idx, end_block_idx, idx_in_warpgroup \
