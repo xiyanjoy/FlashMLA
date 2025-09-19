@@ -45,7 +45,7 @@ else:
 ext_modules = []
 ext_modules.append(
     CUDAExtension(
-        name="flash_mla_sm90",
+        name="flash_mla._flashmla_C",
         sources=[
             "csrc/sm90/flash_api.cpp",
             "csrc/sm90/kernels/get_mla_metadata.cu",
