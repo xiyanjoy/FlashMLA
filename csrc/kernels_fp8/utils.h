@@ -104,8 +104,8 @@ __forceinline__ __device__ void gemm(TiledMma &tiled_mma, Tensor0 const &tCrA, T
     if constexpr (Is_RS) { warpgroup_fence_operand(const_cast<Tensor0 &>(tCrA)); }
 }
 
-template <bool arrive=true, bool commit=true, typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3, typename TiledMma>
-__forceinline__ __device__ void gemm_qk(TiledMma &tiled_mma, Tensor0 const &tCrA, Tensor1 const &tCrB, Tensor2 &tCrC, Tensor3 &s_descale_q) {
+template <bool arrive=true, bool commit=true, typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3, typename Tensor4, typename TiledMma>
+__forceinline__ __device__ void gemm_qk(TiledMma &tiled_mma, Tensor0 const &tCrA, Tensor1 const &tCrB, Tensor2 &tCrC, Tensor3 &s_descale_q, Tensor4 &g_descale_k) {
     warpgroup_fence_operand(tCrC);
     if constexpr (arrive) {
         warpgroup_arrive();
@@ -131,7 +131,7 @@ __forceinline__ __device__ void gemm_qk(TiledMma &tiled_mma, Tensor0 const &tCrA
         CUTLASS_PRAGMA_UNROLL
         for (int reg_id = 0; reg_id < size<0, 1>(rCAccume); ++reg_id) {
             cute::axpby(
-                s_descale_q(warp_id * 16 + reg_id * 8 + lane_id / 4, k_block),
+                s_descale_q(warp_id * 16 + reg_id * 8 + lane_id / 4, k_block) * g_descale_k(k_block),
                 rCAccume(make_coord(_, reg_id, _), _, _),
                 0,
                 rCAccume(make_coord(_, reg_id, _), _, _)
@@ -141,8 +141,8 @@ __forceinline__ __device__ void gemm_qk(TiledMma &tiled_mma, Tensor0 const &tCrA
     }
 }
 
-template <bool arrive=true, bool commit=true, typename Tensor0, typename Tensor1, typename Tensor2, typename TiledMma>
-__forceinline__ __device__ void gemm_pv(TiledMma &tiled_mma, Tensor0 const &tCrA, Tensor1 const &tCrB, Tensor2 &tCrC) {
+template <int which_v=0, bool arrive=true, bool commit=true, typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3, typename TiledMma>
+__forceinline__ __device__ void gemm_pv(TiledMma &tiled_mma, Tensor0 const &tCrA, Tensor1 const &tCrB, Tensor2 &tCrC, Tensor3 &g_descale_v) {
     constexpr bool Is_RS = !cute::is_base_of<cute::GMMA::DescriptorIterator, typename TiledMma::FrgTypeA>::value;
     // Need to cast away const on tCrA since warpgroup_fence_operand doesn't take const
     if constexpr (Is_RS) { cute::warpgroup_fence_operand(const_cast<Tensor0 &>(tCrA)); }
@@ -166,7 +166,11 @@ __forceinline__ __device__ void gemm_pv(TiledMma &tiled_mma, Tensor0 const &tCrA
     warpgroup_wait<0>();
     warpgroup_fence_operand(rCAccume);
 
-    cute::axpby(1, rCAccume, 1, tCrC);
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size<0, 2>(tCrC); ++i) {
+        int idx = which_v * 4 + i / 8;
+        cute::axpby(g_descale_v(idx), rCAccume(make_coord(_, _, i), _, _), 1, tCrC(make_coord(_, _, i), _, _));
+    }
 
     if constexpr (Is_RS) { warpgroup_fence_operand(const_cast<Tensor0 &>(tCrA)); }
 }
