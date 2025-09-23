@@ -182,6 +182,8 @@ struct SharedStorageMLA {
             cute::array_aligned<typename Kernel_traits::ElementAccum, cute::cosize_v<typename Kernel_traits::SmemLayoutO>> smem_o;
         };
     };
+
+    alignas(16) float smem_sDescaleQ[Kernel_traits::kBlockM * 9];
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -312,6 +314,40 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
     Tensor sRow_sum = make_tensor(make_smem_ptr(shared_storage.smem_sum.data()), typename Kernel_traits::SmemLayoutRow{});
     Tensor tRow_sumsRow_sum = sRow_sum(_, tidx % kNThreadsS);
 
+    Tensor g_descale_q = make_tensor(
+        make_gmem_ptr(params.descale_q_ptr),
+        make_shape(
+            params.b,
+            params.s_q,
+            params.h_k,
+            params.h_q / params.h_k,
+            Int<9>{}
+        ),
+        make_stride(
+            params.s_q * params.h_q * 9,
+            params.h_q * 9,
+            params.h_q / params.h_k * 9,
+            Int<9>{},
+            Int<1>{}
+        )
+    );
+    Tensor s_descale_q = make_tensor(
+        make_smem_ptr(shared_storage.smem_sDescaleQ),
+        make_shape(Int<kBlockM>{}, Int<9>{})
+    );
+
+    Tensor g_descale_q_cur = g_descale_q(bidb, _, bidh, _, _);  // (s_q, h_q / h_k, 9)
+    for (int idx = tidx; idx < min(kBlockM, size<0>(g_descale_q_cur) * size<1>(g_descale_q_cur)); idx += blockDim.x) {
+        int cur_idx = m_block * kBlockM + idx;
+        int idx0 = cur_idx / size<1>(g_descale_q_cur);
+        int idx1 = cur_idx % size<1>(g_descale_q_cur);
+        CUTLASS_PRAGMA_UNROLL
+        for (int j = 0; j < size<2>(g_descale_q_cur); ++j) {
+            s_descale_q(idx, j) = g_descale_q_cur(idx0, idx1, j);
+        }
+    }
+    __syncthreads();
+
     typename Kernel_traits::TiledMmaO tiled_mma_o;
     auto thr_mma_o = tiled_mma_o.get_thread_slice(tidx);
     Tensor tOrVt = thr_mma_o.partition_fragment_B(sVt);                // (MMA, MMA_K,MMA_N)
@@ -350,7 +386,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
             __syncthreads();
 
             Tensor tSrS = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // ((MMA=4, X), MMA_M, MMA_N=1)
-            flash::gemm_qk(tiled_mma, tSrQ, tSrK, tSrS);
+            flash::gemm_qk(tiled_mma, tSrQ, tSrK, tSrS, s_descale_q);
 
             const bool is_masking_step = masking_step > 0;
             const bool is_first_masking_step = masking_step == n_masking_steps;
@@ -566,10 +602,9 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params_fp8 pa
     float scale_softmax = params.scale_softmax;
     float scale_softmax_log2 = params.scale_softmax_log2;
     if constexpr (Kernel_traits::Is_FP8) {
-        float descale_q = __ldg(params.descale_q_ptr);
         descale_k = __ldg(params.descale_k_ptr);
-        scale_softmax = scale_softmax * descale_q * descale_k;
-        scale_softmax_log2 = scale_softmax_log2 * descale_q * descale_k;
+        scale_softmax = scale_softmax * descale_k;
+        scale_softmax_log2 = scale_softmax_log2 * descale_k;
     }
 
 #pragma unroll 1

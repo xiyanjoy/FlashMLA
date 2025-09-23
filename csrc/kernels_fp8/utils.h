@@ -104,12 +104,16 @@ __forceinline__ __device__ void gemm(TiledMma &tiled_mma, Tensor0 const &tCrA, T
     if constexpr (Is_RS) { warpgroup_fence_operand(const_cast<Tensor0 &>(tCrA)); }
 }
 
-template <bool arrive=true, bool commit=true, typename Tensor0, typename Tensor1, typename Tensor2, typename TiledMma>
-__forceinline__ __device__ void gemm_qk(TiledMma &tiled_mma, Tensor0 const &tCrA, Tensor1 const &tCrB, Tensor2 &tCrC) {
+template <bool arrive=true, bool commit=true, typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3, typename TiledMma>
+__forceinline__ __device__ void gemm_qk(TiledMma &tiled_mma, Tensor0 const &tCrA, Tensor1 const &tCrB, Tensor2 &tCrC, Tensor3 &s_descale_q) {
     warpgroup_fence_operand(tCrC);
     if constexpr (arrive) {
         warpgroup_arrive();
     }
+
+    const int tidx = threadIdx.x;
+    int warp_id = tidx / 32;
+    int lane_id = tidx % 32;
     Tensor rCAccume = make_tensor_like(tCrC);
 
     // Unroll the K mode manually to set scale D to 1
@@ -124,6 +128,15 @@ __forceinline__ __device__ void gemm_qk(TiledMma &tiled_mma, Tensor0 const &tCrA
         warpgroup_fence_operand(rCAccume);
         warpgroup_wait<0>();
 
+        CUTLASS_PRAGMA_UNROLL
+        for (int reg_id = 0; reg_id < size<0, 1>(rCAccume); ++reg_id) {
+            cute::axpby(
+                s_descale_q(warp_id * 16 + reg_id * 8 + lane_id / 4, k_block),
+                rCAccume(make_coord(_, reg_id, _), _, _),
+                0,
+                rCAccume(make_coord(_, reg_id, _), _, _)
+            );
+        }
         cute::axpby(1, rCAccume, (k_block == 0)? 0: 1, tCrC);
     }
 }
