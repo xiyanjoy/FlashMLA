@@ -315,7 +315,8 @@ CUTLASS_DEVICE void warpgroup_cooperative_pv_gemm_localP(
     Tensor<Engine1, Layout1> &sKV_half,	// (HEAD_DIM_V/2, PAGE_BLOCK_SIZE)
     Tensor<Engine2, Layout2> &rO,	// ((2, 2, 32), 1, 1)
     Tensor<Engine3, Layout3> g_descale_k,  // (9)
-    int idx_in_warpgroup
+    int idx_in_warpgroup,
+    int which_v
 ) {
     TiledMMA tiled_mma = (typename T::TiledMMA_PV_LocalP){};
     ThrMMA thr_mma = tiled_mma.get_slice(idx_in_warpgroup);
@@ -330,7 +331,7 @@ CUTLASS_DEVICE void warpgroup_cooperative_pv_gemm_localP(
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size<0, 2>(rO); ++i) {
         int idx = i / 8;
-        cute::axpby(g_descale_k(idx), rOAccume(make_coord(_, _, i), _, _), 1, rO(make_coord(_, _, i), _, _));
+        cute::axpby(g_descale_k(4 * which_v + idx), rOAccume(make_coord(_, _, i), _, _), 1, rO(make_coord(_, _, i), _, _));
     }
 }
 
@@ -347,7 +348,8 @@ CUTLASS_DEVICE void warpgroup_cooperative_pv_gemm_remoteP(
     Tensor<Engine1, Layout1> &sKV_half,	// (HEAD_DIM_V/2, PAGE_BLOCK_SIZE)
     Tensor<Engine2, Layout2> &rO,	// ((2, 2, 32), 1, 1)
     Tensor<Engine3, Layout3> g_descale_k,  // (9)
-    int idx_in_warpgroup
+    int idx_in_warpgroup,
+    int which_v
 ) {
     TiledMMA tiled_mma = (typename T::TiledMMA_PV_RemoteP){};
     ThrMMA thr_mma = tiled_mma.get_slice(idx_in_warpgroup);
@@ -359,7 +361,7 @@ CUTLASS_DEVICE void warpgroup_cooperative_pv_gemm_remoteP(
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size<0, 2>(rO); ++i) {
         int idx = i / 8;
-        cute::axpby(g_descale_k(idx), rOAccume(make_coord(_, _, i), _, _), 1, rO(make_coord(_, _, i), _, _));
+        cute::axpby(g_descale_k(4 * which_v + idx), rOAccume(make_coord(_, _, i), _, _), 1, rO(make_coord(_, _, i), _, _));
     }
 }
 
@@ -867,7 +869,7 @@ CUTLASS_DEVICE void wg0_subroutine(
     convert_type_out(tOrP_acc, rPb);
 
     // Issue rO0 += rPb @ sV0L
-    warpgroup_cooperative_pv_gemm_localP<T>(rPb, sV0L, rO0, g_descale_k, idx_in_warpgroup);
+    warpgroup_cooperative_pv_gemm_localP<T>(rPb, sV0L, rO0, g_descale_k, idx_in_warpgroup, 0);
 
     // Wait for rO0, launch TMA for the next V0L
     cute::warpgroup_wait<0>();
@@ -887,7 +889,7 @@ CUTLASS_DEVICE void wg0_subroutine(
     if constexpr (!IS_BLK0_LAST) {
         NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::rO1sP0sV0RIssued);
         wg0_rescale_rO0(rO0, sScale1, rL, idx_in_warpgroup);
-        warpgroup_cooperative_pv_gemm_remoteP<T>(sP1, sV1L, rO0, g_descale_k, idx_in_warpgroup);
+        warpgroup_cooperative_pv_gemm_remoteP<T>(sP1, sV1L, rO0, g_descale_k, idx_in_warpgroup, 0);
         // load_sP_to_rPb<T>(sP1, rPb, idx_in_warpgroup);
         // warpgroup_cooperative_pv_gemm_localP<T>(rPb, sV1L, rO0, idx_in_warpgroup);
     }
@@ -995,7 +997,7 @@ CUTLASS_DEVICE void wg1_subroutine(
         save_rPb_to_sP<T>(rP1b, sP1, idx_in_warpgroup);
     }
     if constexpr (!IS_BLK0_LAST) {
-        warpgroup_cooperative_pv_gemm_localP<T>(rP1b, sV1R, rO1, g_descale_k, idx_in_warpgroup);
+        warpgroup_cooperative_pv_gemm_localP<T>(rP1b, sV1R, rO1, g_descale_k, idx_in_warpgroup, 1);
         if constexpr (!IS_BLK1_LAST) {
             // We use this proxy for making sP1 visible to the async proxy
             // We skip it if IS_BLK1_LAST, since in that case we have already put a fence
@@ -1006,7 +1008,7 @@ CUTLASS_DEVICE void wg1_subroutine(
     // Wait for sP0, issue rO1 += sP0 @ sV0R, notify warpgroup 0
     NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sP0Ready);
 
-    warpgroup_cooperative_pv_gemm_remoteP<T>(sP0, sV0R, rO1, g_descale_k, idx_in_warpgroup);
+    warpgroup_cooperative_pv_gemm_remoteP<T>(sP0, sV0R, rO1, g_descale_k, idx_in_warpgroup, 1);
     // load_sP_to_rPb<T>(sP0, rP1b, idx_in_warpgroup);
     // warpgroup_cooperative_pv_gemm_localP<T>(rP1b, sV0R, rO1, idx_in_warpgroup);
     if constexpr (!IS_BLK0_LAST) {
