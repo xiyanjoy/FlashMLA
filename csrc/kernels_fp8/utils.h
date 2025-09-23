@@ -104,6 +104,30 @@ __forceinline__ __device__ void gemm(TiledMma &tiled_mma, Tensor0 const &tCrA, T
     if constexpr (Is_RS) { warpgroup_fence_operand(const_cast<Tensor0 &>(tCrA)); }
 }
 
+template <bool arrive=true, bool commit=true, typename Tensor0, typename Tensor1, typename Tensor2, typename TiledMma>
+__forceinline__ __device__ void gemm_qk(TiledMma &tiled_mma, Tensor0 const &tCrA, Tensor1 const &tCrB, Tensor2 &tCrC) {
+    warpgroup_fence_operand(tCrC);
+    if constexpr (arrive) {
+        warpgroup_arrive();
+    }
+    Tensor rCAccume = make_tensor_like(tCrC);
+
+    // Unroll the K mode manually to set scale D to 1
+    CUTLASS_PRAGMA_UNROLL
+    for (int k_block = 0; k_block < size<2, 1>(tCrA); ++k_block) {
+        tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
+        cute::gemm(tiled_mma, tCrA(_,_,make_coord(0, k_block)), tCrB(_,_,make_coord(0, k_block)), rCAccume);
+        tiled_mma.accumulate_ = GMMA::ScaleOut::One;
+        cute::gemm(tiled_mma, tCrA(_,_,make_coord(1, k_block)), tCrB(_,_,make_coord(1, k_block)), rCAccume);
+
+        warpgroup_commit_batch();
+        warpgroup_fence_operand(rCAccume);
+        warpgroup_wait<0>();
+
+        cute::axpby(1, rCAccume, (k_block == 0)? 0: 1, tCrC);
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // For SM80, convert acc_layout from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))

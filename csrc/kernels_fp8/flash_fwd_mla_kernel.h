@@ -350,7 +350,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
             __syncthreads();
 
             Tensor tSrS = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // ((MMA=4, X), MMA_M, MMA_N=1)
-            flash::gemm</*zero_init=*/true, /*wg_wait=*/0>(tiled_mma, tSrQ, tSrK, tSrS);
+            flash::gemm_qk(tiled_mma, tSrQ, tSrK, tSrS);
 
             const bool is_masking_step = masking_step > 0;
             const bool is_first_masking_step = masking_step == n_masking_steps;
@@ -395,7 +395,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
                 cutlass::arch::NamedBarrier::sync(kNThreads, static_cast<int>(NamedBarriers::TransVReady));
                 __syncthreads();
             }
-            flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_o, tOrP, tOrVt, tOrO);
+            flash::gemm_pv</*wg_wait=*/0>(tiled_mma_o, tOrP, tOrVt, tOrO);
 
             // Double buffer for sK
             const int sK_offset = n_block % 2 == 0 ? size(sK) : -size(sK);
@@ -522,7 +522,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
             flash::rescale_o(tOrO, scale_o);
 
             if constexpr (Kernel_traits::Is_FP8) __syncthreads();
-            flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_o, tOrP, tOrVt, tOrO);
+            flash::gemm_pv</*wg_wait=*/0>(tiled_mma_o, tOrP, tOrVt, tOrO);
 
             if constexpr (!Kernel_traits::Is_FP8) {
                 // Double buffer for sK
