@@ -395,7 +395,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
                 cutlass::arch::NamedBarrier::sync(kNThreads, static_cast<int>(NamedBarriers::TransVReady));
                 __syncthreads();
             }
-            flash::gemm_pv</*wg_wait=*/0>(tiled_mma_o, tOrP, tOrVt, tOrO);
+            flash::gemm_pv(tiled_mma_o, tOrP, tOrVt, tOrO);
 
             // Double buffer for sK
             const int sK_offset = n_block % 2 == 0 ? size(sK) : -size(sK);
@@ -522,7 +522,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
             flash::rescale_o(tOrO, scale_o);
 
             if constexpr (Kernel_traits::Is_FP8) __syncthreads();
-            flash::gemm_pv</*wg_wait=*/0>(tiled_mma_o, tOrP, tOrVt, tOrO);
+            flash::gemm_pv(tiled_mma_o, tOrP, tOrVt, tOrO);
 
             if constexpr (!Kernel_traits::Is_FP8) {
                 // Double buffer for sK

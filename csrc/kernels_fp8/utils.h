@@ -128,6 +128,36 @@ __forceinline__ __device__ void gemm_qk(TiledMma &tiled_mma, Tensor0 const &tCrA
     }
 }
 
+template <bool arrive=true, bool commit=true, typename Tensor0, typename Tensor1, typename Tensor2, typename TiledMma>
+__forceinline__ __device__ void gemm_pv(TiledMma &tiled_mma, Tensor0 const &tCrA, Tensor1 const &tCrB, Tensor2 &tCrC) {
+    constexpr bool Is_RS = !cute::is_base_of<cute::GMMA::DescriptorIterator, typename TiledMma::FrgTypeA>::value;
+    // Need to cast away const on tCrA since warpgroup_fence_operand doesn't take const
+    if constexpr (Is_RS) { cute::warpgroup_fence_operand(const_cast<Tensor0 &>(tCrA)); }
+    warpgroup_fence_operand(tCrC);
+    if constexpr (arrive) {
+        warpgroup_arrive();
+    }
+    Tensor rCAccume = make_tensor_like(tCrC);
+
+    tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
+    // Unroll the K mode manually to set scale D to 1
+    CUTLASS_PRAGMA_UNROLL
+    for (int k_block = 0; k_block < size<2>(tCrA); ++k_block) {
+        cute::gemm(tiled_mma, tCrA(_,_,k_block), tCrB(_,_,k_block), rCAccume);
+        tiled_mma.accumulate_ = GMMA::ScaleOut::One;
+    }
+
+    if constexpr (commit) {
+        warpgroup_commit_batch();
+    }
+    warpgroup_wait<0>();
+    warpgroup_fence_operand(rCAccume);
+
+    cute::axpby(1, rCAccume, 1, tCrC);
+
+    if constexpr (Is_RS) { warpgroup_fence_operand(const_cast<Tensor0 &>(tCrA)); }
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // For SM80, convert acc_layout from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
