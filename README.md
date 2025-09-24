@@ -1,68 +1,183 @@
 # FlashMLA
 
-## Performance Update (2025.04.22)
-
-We're excited to announce the new release of Flash MLA, which delivers 5% ~ 15% performance improvement on compute-bound workloads, achieving up to 660 TFlops on NVIDIA H800 SXM5 GPUs. The interface of the new version is fully compatible with the old one. Just switch to the new version and enjoy the instant speedup! 🚀🚀🚀
-
-Besides, we'd love to share the technical details behind the new kernel! Check out our deep-dive write-up [here](docs/20250422-new-kernel-deep-dive.md).
-
-The new kernel primarily targets compute-intensive settings (where the number of q heads $\times$ the number of q tokens per request (if MTP is disabled then it's 1) $\ge 64$). For memory-bound cases, we recommend using version [b31bfe7](https://github.com/deepseek-ai/FlashMLA/tree/b31bfe72a83ea205467b3271a5845440a03ed7cb) for optimal performance.
-
 ## Introduction
 
-FlashMLA is an efficient MLA decoding kernel for Hopper GPUs, optimized for variable-length sequences serving.
+FlashMLA is DeepSeek's library of optimized attention kernels, powering the [DeepSeek-V3](https://github.com/deepseek-ai/DeepSeek-V3) and [DeepSeek-V3.2](TODO) models. This repository contains the following implementations:
 
-Currently released:
-- BF16, FP16
-- Paged kvcache with block size of 64
+**Sparse Attention Kernels**
 
-## Requirements
+*These kernels power DeepSeek Sparse Attention (DSA), as introduced in [this paper](TODO).*
 
-- Hopper GPUs
-- CUDA 12.8 and above
-- PyTorch 2.0 and above
+- Token-level sparse attention for the prefill stage
+- Token-level sparse attention for the decoding stage, with FP8 KV cache
 
-## Quick start
+**Dense Attention Kernels**
 
-### Install
+- Dense attention for the prefill stage
+- Dense attention for the decoding stage
+
+## News
+
+- **2025.09.26(TODO) Release of Sparse Attention Kernels**: With the launch of [DeepSeek-V3.2](TODO), we are releasing the corresponding token-level sparse attention kernels. These kernels power the model's DeepSeek Sparse Attention (DSA) and achieve up to 640 TFlops during prefilling and 410 TFlops during decoding.
+- **2025.08.01 Kernels for MHA on Blackwell**: Thanks to [NVIDIA's PR](https://github.com/deepseek-ai/FlashMLA/pull/76) for MHA forward / backward kernels on Blackwell!
+- **2025.04.22 Deep-Dive Blog**: We'd love to share the technical details behind the new FlashMLA kernel! Check out our deep-dive write-up [here](docs/20250422-new-kernel-deep-dive.md).
+- **2025.04.22 Performance Update**: We're excited to announce the new release of Flash MLA, which delivers 5% ~ 15% performance improvement for compute-bound workloads, achieving up to 660 TFlops on NVIDIA H800 SXM5 GPUs. The interface of the new version is fully compatible with the old one. Simply upgrade to the new version for an immediate performance boost! 🚀🚀🚀
+
+## Performance
+
+#### Test & benchmark MLA decoding (Sparse & Dense):
 
 ```bash
-pip install -v .
+python tests/test_flash_mla_decoding.py
 ```
 
-### Benchmark
+The dense MLA decoding kernel can achieve up to 3000 GB/s in memory-bound configuration and 660 TFLOPS in computation-bound configuration on H800 SXM5, using CUDA 12.8. For token-level sparse MLA decoding kernel (which uses an FP8 KV cache while performing the matrix multiplication in bfloat16), it can achieve 410 TFLOPS in compute-bound configuration on H800 SXM5, CUDA 12.8.
 
-#### Testing MLA Decoding 
-
-```bash
-python tests/test_flash_mla_sm90.py
-```
-
-#### Testing MLA Forward/Backward
+#### Test & benchmark MHA prefill (Dense):
 
 ```bash
 python tests/test_fmha_sm100.py
 ```
 
-It is able up to 3000 GB/s in memory-bound configuration and 660 TFLOPS in computation-bound configuration on H800 SXM5, using CUDA 12.8.
+It achieves up to 1460 TFlops in forward and 1000 TFlops in backward computation on B200, as reported by NVIDIA.
 
-Note. For memory-bound cases, we recommend using version [b31bfe7](https://github.com/deepseek-ai/FlashMLA/tree/b31bfe72a83ea205467b3271a5845440a03ed7cb) for optimal performance.
+#### Test & benchmark MLA prefill (Sparse):
 
-### Usage
+```bash
+python tests/test_flash_mla_prefill.py
+```
+
+It achieves up to 640 TFlops in forward computation on H800 SXM5, CUDA 12.8.
+
+## Requirements
+
+- Hopper / Blackwell GPUs (See the support matrix below)
+- CUDA 12.8 and above (CUDA 12.9+ is required for Blackwell kernels)
+- PyTorch 2.0 and above
+
+Support matrix:
+
+| Kernel | GPU Architecture | MLA Mode [2] | KVCache Format |
+| :---: | :---: | :---: | :---: |
+| Dense Decoding | Hopper | MQA | BF16 |
+| Sparse Decoding | Hopper | MQA | FP8 [1] |
+| Dense Prefill | Blackwell | MHA |  |
+| Sparse Prefill | Hopper | MQA |  |
+
+[1]: For more details on using FP8 KV cache, see documents below.
+
+[2]: Here "MLA Mode" refers to the mode used for MLA calculation. MQA stands for Multi-Query Attention mode (i.e. `head_dim_k` =  576 with `head_dim_v` = 512), while MHA stands for Multi-Head Attention mode (i.e. `head_dim_k` = 192 / 128 with `head_dim_v` = 128). For a detailed explanation of these modes, please refer to the appendix of [DeepSeek V3.2's Paper](TODO).
+
+## Installation
+
+```bash
+git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla
+cd flash-mla
+git submodule update --init --recursive
+pip install -v .
+```
+
+## Usage
+
+### MLA Decoding
+
+To use the MLA decoding kernels, call get_mla_metadata once before the decoding loop to get the tile scheduler metadata. Then, call flash_mla_with_kvcache in each decoding step. For example:
 
 ```python
 from flash_mla import get_mla_metadata, flash_mla_with_kvcache
 
-tile_scheduler_metadata, num_splits = get_mla_metadata(cache_seqlens, s_q * h_q // h_kv, h_kv)
+tile_scheduler_metadata, num_splits = get_mla_metadata(
+    cache_seqlens,
+    s_q * h_q // h_kv,
+    h_kv,
+    h_q,
+    is_fp8,
+    topk,
+)
 
 for i in range(num_layers):
     ...
     o_i, lse_i = flash_mla_with_kvcache(
         q_i, kvcache_i, block_table, cache_seqlens, dv,
-        tile_scheduler_metadata, num_splits, causal=True,
+        tile_scheduler_metadata, num_splits,
+        is_causal, is_fp8_kvcache, indices,
     )
     ...
 ```
+
+Where
+
+- `s_q` is the number of q tokens per q sequence. If MTP (speculative decoding) is disabled, it should be 1.
+- `h_kv` is the number of key-value heads.
+- `h_q` is the number of query heads.
+
+**FP8 KV Cache:**
+If `is_fp8_kvcache` is set to `True`, the kernel reads the KV cache in the "FP8 with scale" format (described below). It dequantizes the cache to bfloat16 and performs attention computation in bfloat16. The output is also in bfloat16.
+
+In the "FP8 with scale" format, each token's KV cache is 656 Bytes, structured as:
+-   **First 512 bytes:** The "quantized NoPE" part, containing 512 `float8_e4m3` values.
+-   **Next 16 bytes:** Scale factors, containing 4 `float32` values. The first `float32` is the scale for the first 128 `float8_e4m3` values, the second for the next 128, and so on.
+-   **Last 128 bytes:** The "RoPE" part, containing 64 `bfloat16` values. This part is not quantized for accuracy.
+
+See `tests/quant.py` for quantization and dequantization details.
+
+**Sparse Attention (`indices` tensor):**
+The `indices` tensor (if provided) enables token-level sparse attention by instructing the kernel to compute attention only for specified tokens.
+
+-   **Shape:** `indices` should be a 3D tensor of shape `(batch_size, seq_len_q, topk)`.
+-   **Format:** `indices_in_kvcache[i][j][k] = (the index of the page block where token t resides) * page_block_size + (the offset of token t within the page block)`, where `t` is the k-th token for the j-th query sequence in the i-th batch. Since the index of the page block has already been encoded into `indices_in_kvcache`, the kernel does not require the `block_table` parameter.
+-   **Invalid entries:** Set invalid indices to `-1`.
+
+**Return Values:**
+The kernel returns `(out, lse)`, where:
+-   `out` is the attention result.
+-   `lse` is the log-sum-exp value of the attention scores for each query head.
+
+See `tests/test_flash_mla_decoding.py` for a complete example.
+
+### Sparse MLA Prefill
+
+For the sparse MLA prefill kernel, call `flash_mla_sparse_fwd` directly with the following parameters:
+-   `q`: Query tensor of shape `[s_q, h_q, d_qk]`
+-   `kv`: Key-Value tensor of shape `[s_kv, h_kv, d_qk]`
+-   `indices`: Indices tensor of shape `[s_q, h_kv, topk]`
+-   `sm_scale`: A scalar value
+
+**Note on batching:** This kernel does not support a batch dimension. For multi-batch inference, reshape the input tensors and adjust the `indices` parameter to simulate batch processing.
+
+**Invalid indices:** Set invalid entries in `indices` to `-1` or any number `>= s_kv`.
+
+**Return Values and Equivalent PyTorch Code:**
+The kernel returns `(out, max_logits, lse)`. This is equivalent to the following PyTorch operations:
+
+```python
+Q: [s_q, h_q, d_qk], bfloat16
+kv: [s_kv, h_kv, d_qk], bfloat16
+indices: [s_q, h_kv, topk], int32
+
+kv = kv.squeeze(1)  # [s_kv, d_qk], h_kv must be 1
+indices = indices.squeeze(1)    # [s_q, topk]
+focused_kv = kv[indices]    # For the i-th sequence (s_q), the corresponding KV tokens are selected from the KV cache based on indices[i, :]. This operation results in a tensor of shape [s_q, topk, d_qk].
+
+P = (Q @ focused_kv.transpose(-1, -2)) * sm_scale * math.log2(math.e)    # [s_q, h_q, topk]
+max_logits = P.max(dim=-1) # [s_q, h_q]
+lse = log2sumexp2(P, dim=-1, base=2)   # [s_q, h_q]，"log2sumexp2" means that the exponentiation and logarithm are base-2
+S = exp2(P - lse)      # [s_q, h_q, topk]
+out = S @ focused_kv  # [s_q, h_q, d_qk]
+
+return (out, max_logits, lse)
+```
+
+See `tests/test_flash_mla_prefill.py` for a complete example.
+
+### Dense MHA Prefill
+
+This kernel implements the standard dense Multi-Head Attention (MHA) forward and backward operations. It can be called using:
+-   `flash_attn_varlen_func`
+-   `flash_attn_varlen_qkvpacked_func`
+-   `flash_attn_varlen_kvpacked_func`
+
+The usage is similar to the `flash_attn` package. See `tests/test_fmha_sm100.py` for a complete example.
 
 ## Acknowledgement
 
@@ -109,7 +224,7 @@ The corresponding FlashMLA version can be found at: [AITER/MLA](https://github.c
 
 ```bibtex
 @misc{flashmla2025,
-      title={FlashMLA: Efficient MLA decoding kernels},
+      title={FlashMLA: Efficient Multi-head Latent Attention Kernels},
       author={Jiashi Li, Shengyu Liu},
       year={2025},
       publisher = {GitHub},
