@@ -10,9 +10,10 @@
 using TMABarrier = cutlass::arch::ClusterTransactionBarrier;
 using namespace cute;
 
-template<typename InputT_>
+template<typename InputT_, typename KT_>
 struct Traits {
     using InputT = InputT_;
+    using KT = KT_;
     
     static constexpr int BLOCK_SIZE_M = Config::BLOCK_SIZE_M;
     static constexpr int PAGE_BLOCK_SIZE = Config::PAGE_BLOCK_SIZE;
@@ -20,6 +21,7 @@ struct Traits {
     static constexpr int HEAD_DIM_V = Config::HEAD_DIM_V;
 
     static constexpr int NUM_THREADS = 256;
+    static constexpr int NUM_WRAP = 256 / 32;
 
     static_assert(std::is_same_v<InputT, cutlass::bfloat16_t> || std::is_same_v<InputT, cutlass::half_t>);
 
@@ -53,6 +55,10 @@ struct Traits {
         Shape<Int<PAGE_BLOCK_SIZE>, Int<HEAD_DIM_K>>{}
     ));
 
+    using SmemLayoutKShuffle = Layout<
+            Shape<Int<8>, Int<NUM_WRAP>, Int<16>>,
+            Stride<Int<NUM_WRAP * 16>, Int<16>, _1>>;
+
     using SmemLayoutV = decltype(composition(
         SmemLayoutK{},
         make_layout(Shape<Int<HEAD_DIM_V>, Int<PAGE_BLOCK_SIZE>>{}, GenRowMajor{})
@@ -72,6 +78,7 @@ struct Traits {
         cute::array_aligned<InputT, cosize_v<SmemLayoutQ>> smem_sQ;
         cute::array_aligned<InputT, cosize_v<SmemLayoutK>> smem_sK0;
         cute::array_aligned<InputT, cosize_v<SmemLayoutK>> smem_sK1;
+        cute::array_aligned<InputT, cosize_v<SmemLayoutKShuffle>> smem_sKShuffle;
         cute::array_aligned<InputT, cosize_v<SmemLayoutP0>> smem_sP0;
         cute::array_aligned<float, BLOCK_SIZE_M> smem_sM;
         cute::array_aligned<float, 2*BLOCK_SIZE_M> sL_reduction_wksp;

@@ -77,8 +77,9 @@ mha_fwd_kvcache_mla(
 
     // Check data types
     auto q_dtype = q.dtype();
+    auto k_dtype = kcache.dtype();
     TORCH_CHECK(q_dtype == torch::kBFloat16 || q_dtype == torch::kHalf);
-    TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
+    TORCH_CHECK(k_dtype == q_dtype || k_dtype == torch::kFloat8_e4m3fn);
     TORCH_CHECK(seqlens_k.dtype() == torch::kInt32, "seqlens_k must have dtype int32");
     TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must have dtype torch.int32");
     TORCH_CHECK(tile_scheduler_metadata.dtype() == torch::kInt32, "tile_scheduler_metadata must have dtype int32");
@@ -188,7 +189,11 @@ mha_fwd_kvcache_mla(
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     TORCH_CHECK(head_size_k == 576);
     if (q_dtype == torch::kBFloat16) {
-        run_flash_splitkv_mla_kernel<cutlass::bfloat16_t>(params, stream);
+        if (k_dtype == torch::kFloat8_e4m3fn) {
+            run_flash_splitkv_mla_kernel<cutlass::bfloat16_t, cutlass::float_e4m3_t>(params, stream);
+        } else {
+            run_flash_splitkv_mla_kernel<cutlass::bfloat16_t>(params, stream);
+        }
         run_flash_mla_combine_kernel<cutlass::bfloat16_t>(params, stream);
     } else if (q_dtype == torch::kHalf) {
 #ifdef FLASH_MLA_DISABLE_FP16

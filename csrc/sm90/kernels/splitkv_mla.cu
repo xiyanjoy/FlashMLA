@@ -1270,9 +1270,9 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
 }
 
 
-template<typename InputT>
+template<typename InputT, typename KT=InputT>
 void run_flash_splitkv_mla_kernel(Flash_fwd_mla_params &params, cudaStream_t stream) {
-    using T = Traits<InputT>;
+    using T = Traits<InputT, KT>;
     auto shape_Q = make_shape(params.q_seq_per_hk, params.d, params.h_k, params.b);
     auto tma_Q = cute::make_tma_copy(
         SM90_TMA_LOAD{},
@@ -1328,6 +1328,10 @@ void run_flash_splitkv_mla_kernel(Flash_fwd_mla_params &params, cudaStream_t str
     };
     auto mla_kernel = &flash_fwd_splitkv_mla_kernel<T, decltype(tma_params)>;
     constexpr size_t smem_size = sizeof(typename T::SharedMemoryPlan);
+    printf("smem_size: %d B  (%.1f KB)\n", smem_size, smem_size / 1024.0f);
+    int maxSmem = 0;
+    cudaDeviceGetAttribute(&maxSmem, cudaDevAttrMaxSharedMemoryPerBlock, 0);
+    printf("max shared memory per block = %d B  (%.1f KB)\n", maxSmem, maxSmem / 1024.0f);
     CHECK_CUDA(cudaFuncSetAttribute(mla_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
     // Use cudaLaunchKernelEx to enable PDL (Programmatic Dependent Launch)
@@ -1348,7 +1352,9 @@ void run_flash_splitkv_mla_kernel(Flash_fwd_mla_params &params, cudaStream_t str
 }
 
 template void run_flash_splitkv_mla_kernel<cutlass::bfloat16_t>(Flash_fwd_mla_params &params, cudaStream_t stream);
+template void run_flash_splitkv_mla_kernel<cutlass::bfloat16_t, cutlass::float_e4m3_t>(Flash_fwd_mla_params &params, cudaStream_t stream);
 
 #ifndef FLASH_MLA_DISABLE_FP16
 template void run_flash_splitkv_mla_kernel<cutlass::half_t>(Flash_fwd_mla_params &params, cudaStream_t stream);
+template void run_flash_splitkv_mla_kernel<cutlass::half_t, cutlass::float_e4m3_t>(Flash_fwd_mla_params &params, cudaStream_t stream);
 #endif
