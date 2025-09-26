@@ -424,6 +424,8 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
             if constexpr (Kernel_traits::Is_FP8) { flash::permute_Cregs_fp8(tSrS); }
             Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<typename Kernel_traits::TiledMmaO>(tSrS.layout()));
             Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
+            // tOrP_acc always < 1, so we provide it with a 448 scale.
+            cute::axpby(448, tOrP_acc, 0, tOrP_acc);
             convert_type_out(tOrP_acc, tOrP);
             
             cute::copy(tOrP, tPsP); // send Aregs of MMA1 instead of Cregs of MMA0
@@ -580,7 +582,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size<0, 2>(tOrO); ++i) {
         int idx = warp_group_idx * 4 + i / 8;
-        cute::axpby(g_descale_k(idx), tOrO(make_coord(_, _, i), _, _), 0, tOrO(make_coord(_, _, i), _, _));
+        cute::axpby(g_descale_k(idx) / 448.0, tOrO(make_coord(_, _, i), _, _), 0, tOrO(make_coord(_, _, i), _, _));
     }
 
     if (NoSplit)
