@@ -104,6 +104,27 @@ __forceinline__ __device__ void gemm(TiledMma &tiled_mma, Tensor0 const &tCrA, T
     if constexpr (Is_RS) { warpgroup_fence_operand(const_cast<Tensor0 &>(tCrA)); }
 }
 
+template <int K_BLOCK, typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3>
+__device__ __forceinline__ void body(Tensor0 &rCAccume, Tensor1 &tCrC, Tensor2 &s_descale_q, Tensor3 &g_descale_k) {
+    const int tidx = threadIdx.x;
+    int warp_id = tidx / 32;
+    int lane_id = tidx % 32;
+    warpgroup_fence_operand(rCAccume);
+    constexpr int wg_wait = (8 - K_BLOCK > 7)? 7: 8 - K_BLOCK;
+    warpgroup_wait<wg_wait>();
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int reg_id = 0; reg_id < size<0, 1>(rCAccume); ++reg_id) {
+        cute::axpby(
+            s_descale_q(warp_id * 16 + reg_id * 8 + lane_id / 4, K_BLOCK) * g_descale_k(K_BLOCK),
+            rCAccume(make_coord(_, reg_id, _), _, _),
+            0,
+            rCAccume(make_coord(_, reg_id, _), _, _)
+        );
+    }
+    cute::axpby(1, rCAccume, (K_BLOCK == 0)? 0: 1, tCrC);
+}
+
 template <bool arrive=true, bool commit=true, typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3, typename Tensor4, typename TiledMma>
 __forceinline__ __device__ void gemm_qk(TiledMma &tiled_mma, Tensor0 const &tCrA, Tensor1 const &tCrB, Tensor2 &tCrC, Tensor3 &s_descale_q, Tensor4 &g_descale_k) {
     warpgroup_fence_operand(tCrC);
@@ -114,31 +135,40 @@ __forceinline__ __device__ void gemm_qk(TiledMma &tiled_mma, Tensor0 const &tCrA
     const int tidx = threadIdx.x;
     int warp_id = tidx / 32;
     int lane_id = tidx % 32;
-    Tensor rCAccume = make_tensor_like(tCrC);
+    Tensor rCAccume_list = make_tensor<float>(
+        make_shape(make_shape(_2{}, _2{}, _8{}), _1{}, _1{}, Int<9>{})
+    );
 
     // Unroll the K mode manually to set scale D to 1
     CUTLASS_PRAGMA_UNROLL
     for (int k_block = 0; k_block < size<2, 1>(tCrA); ++k_block) {
+        Tensor rCAccume = rCAccume_list(_, _, _, k_block);
         tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
         cute::gemm(tiled_mma, tCrA(_,_,make_coord(0, k_block)), tCrB(_,_,make_coord(0, k_block)), rCAccume);
         tiled_mma.accumulate_ = GMMA::ScaleOut::One;
         cute::gemm(tiled_mma, tCrA(_,_,make_coord(1, k_block)), tCrB(_,_,make_coord(1, k_block)), rCAccume);
 
         warpgroup_commit_batch();
-        warpgroup_fence_operand(rCAccume);
-        warpgroup_wait<0>();
-
-        CUTLASS_PRAGMA_UNROLL
-        for (int reg_id = 0; reg_id < size<0, 1>(rCAccume); ++reg_id) {
-            cute::axpby(
-                s_descale_q(warp_id * 16 + reg_id * 8 + lane_id / 4, k_block) * g_descale_k(k_block),
-                rCAccume(make_coord(_, reg_id, _), _, _),
-                0,
-                rCAccume(make_coord(_, reg_id, _), _, _)
-            );
-        }
-        cute::axpby(1, rCAccume, (k_block == 0)? 0: 1, tCrC);
     }
+
+    Tensor rCAccume = rCAccume_list(_, _, _, 0);
+    body<0>(rCAccume, tCrC, s_descale_q, g_descale_k);
+    rCAccume = rCAccume_list(_, _, _, 1);
+    body<1>(rCAccume, tCrC, s_descale_q, g_descale_k);
+    rCAccume = rCAccume_list(_, _, _, 2);
+    body<2>(rCAccume, tCrC, s_descale_q, g_descale_k);
+    rCAccume = rCAccume_list(_, _, _, 3);
+    body<3>(rCAccume, tCrC, s_descale_q, g_descale_k);
+    rCAccume = rCAccume_list(_, _, _, 4);
+    body<4>(rCAccume, tCrC, s_descale_q, g_descale_k);
+    rCAccume = rCAccume_list(_, _, _, 5);
+    body<5>(rCAccume, tCrC, s_descale_q, g_descale_k);
+    rCAccume = rCAccume_list(_, _, _, 6);
+    body<6>(rCAccume, tCrC, s_descale_q, g_descale_k);
+    rCAccume = rCAccume_list(_, _, _, 7);
+    body<7>(rCAccume, tCrC, s_descale_q, g_descale_k);
+    rCAccume = rCAccume_list(_, _, _, 8);
+    body<8>(rCAccume, tCrC, s_descale_q, g_descale_k);
 }
 
 template <int which_v=0, bool arrive=true, bool commit=true, typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3, typename TiledMma>
