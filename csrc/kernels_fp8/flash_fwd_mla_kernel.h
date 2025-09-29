@@ -582,7 +582,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size<0, 2>(tOrO); ++i) {
         int idx = warp_group_idx * 4 + i / 8;
-        cute::axpby(g_descale_k(idx) / 448.0, tOrO(make_coord(_, _, i), _, _), 0, tOrO(make_coord(_, _, i), _, _));
+        cute::axpby(g_descale_k(idx), tOrO(make_coord(_, _, i), _, _), 0, tOrO(make_coord(_, _, i), _, _));
     }
 
     if (NoSplit)
