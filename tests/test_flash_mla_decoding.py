@@ -2,20 +2,20 @@ import argparse
 import math
 import random
 import dataclasses
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 
 import torch
 import triton
 
-import quant
 import flash_mla
+import quant
 from lib import cdiv, check_is_allclose
 
 @dataclasses.dataclass
 class TestParam:
-    b: int	# Batch size
-    s_q: int	# Number of queries for one request
-    s_k: int	# Seq len, or mean seq len if varlen == True
+    b: int    # Batch size
+    s_q: int  # Number of queries for one request
+    s_k: int  # Seq len, or mean seq len if varlen == True
     is_varlen: bool
     is_causal: bool
     is_fp8: bool
@@ -24,8 +24,8 @@ class TestParam:
     is_all_indices_invalid: bool = False
     have_zero_seqlen_k: bool = False
     block_size: int = 64
-    h_q: int = 128	# Number of q heads
-    h_kv: int = 1   # Number of kv heads
+    h_q: int = 128    # Number of q heads
+    h_kv: int = 1     # Number of kv heads
     d: int = 576      # Q/K head dim (= dv + RoPE dim)
     dv: int = 512     # V head dim
     seed: int = 0
@@ -71,7 +71,7 @@ def generate_test_data(t: TestParam) -> Tuple[torch.Tensor, torch.Tensor, torch.
             cur_num_blocks = cdiv(cur_len, t.block_size)
             blocked_k[block_table[i][cur_num_blocks:]] = float("nan")
             if cur_len % t.block_size != 0:
-                blocked_k[block_table[i][cur_num_blocks-1]][cur_len % t.block_size:] = float("nan")
+                blocked_k[block_table[i][cur_num_blocks - 1]][cur_len % t.block_size:] = float("nan")
             block_table[i][cur_num_blocks:] = 2147480000
         return cache_seqlens, q, block_table, blocked_k, None, None
     else:
@@ -82,12 +82,12 @@ def generate_test_data(t: TestParam) -> Tuple[torch.Tensor, torch.Tensor, torch.
             # Generate indices
             for j in range(t.s_q):
                 cur_abs_indices = torch.randperm(int(cache_seqlens_cpu[i].item()), device="cpu")[:t.topk]
-                cur_blocked_indices = block_table_cpu[i, cur_abs_indices//t.block_size]*t.block_size + (cur_abs_indices%t.block_size)
+                cur_blocked_indices = block_table_cpu[i, cur_abs_indices // t.block_size] * t.block_size + (cur_abs_indices % t.block_size)
                 if len(cur_abs_indices) < t.topk:
                     pad_len = t.topk - len(cur_abs_indices)
                     cur_abs_indices = torch.cat([cur_abs_indices, torch.full((pad_len,), -1, device='cpu')])
                     cur_blocked_indices = torch.cat([cur_blocked_indices, torch.full((pad_len,), -1, device='cpu')])
-                
+
                 # Mask KV
                 perm = torch.randperm(t.topk, device='cpu')
                 cur_abs_indices = cur_abs_indices[perm]
@@ -100,7 +100,7 @@ def generate_test_data(t: TestParam) -> Tuple[torch.Tensor, torch.Tensor, torch.
 
                 abs_indices[i, j, :] = cur_abs_indices
                 indices_in_kvcache[i, j, :] = cur_blocked_indices
-            
+
         # Mask nonused KV as NaN
         all_indices = indices_in_kvcache.flatten().tolist()
         all_indices = list(set(all_indices))
@@ -109,11 +109,11 @@ def generate_test_data(t: TestParam) -> Tuple[torch.Tensor, torch.Tensor, torch.
         all_indices = torch.tensor(all_indices, dtype=torch.int32, device='cpu')
 
         blocked_k = blocked_k.view(-1, t.h_kv, t.d)
-        nonused_indices_mask = torch.ones(blocked_k.size(0)*blocked_k.size(1), dtype=torch.bool, device='cpu')
+        nonused_indices_mask = torch.ones(blocked_k.size(0) * blocked_k.size(1), dtype=torch.bool, device='cpu')
         nonused_indices_mask[all_indices] = False
         blocked_k[nonused_indices_mask, :, :] = float("nan")
         blocked_k = blocked_k.view(-1, t.block_size, t.h_kv, t.d)
-        
+
         abs_indices = abs_indices.to(q.device)
         indices_in_kvcache = indices_in_kvcache.to(q.device)
 
@@ -139,7 +139,7 @@ def reference_torch(
             valid_indices = cur_indices[cur_indices != -1]
             mask[i, valid_indices] = True
         return mask
-    
+
     def scaled_dot_product_attention(
         batch_idx: int,
         query: torch.Tensor,    # [h_q, s_q, d]
@@ -157,7 +157,7 @@ def reference_torch(
         if h_kv != 1:
             kv = kv.repeat_interleave(h_q // h_kv, dim=0)
         kv[kv != kv] = 0.0
-        attn_weight = query @ kv.transpose(-2, -1) # [h_q, s_q, s_k]
+        attn_weight = query @ kv.transpose(-2, -1)  # [h_q, s_q, s_k]
         if (is_causal and query.size(1) > 1) or indices is not None:
             mask = torch.ones(s_q, s_k, dtype=torch.bool)
             if is_causal:
@@ -169,14 +169,14 @@ def reference_torch(
             attn_bias.masked_fill_(mask.logical_not(), float("-inf"))
             attn_weight += attn_bias.to(q.dtype)
         attn_weight /= math.sqrt(query.size(-1))
-        lse = attn_weight.logsumexp(dim=-1) # [h_q, s_q]
+        lse = attn_weight.logsumexp(dim=-1)  # [h_q, s_q]
         attn_weight = torch.softmax(attn_weight, dim=-1, dtype=torch.float32)
         output = attn_weight @ kv[..., :dv]    # [h_q, s_q, dv]
         # Correct for q tokens which has no attendable k
         lonely_q_mask = (lse == float("-inf"))
         output[lonely_q_mask.unsqueeze(-1).broadcast_to(h_q, s_q, dv)] = 0.0
         lse[lonely_q_mask] = float("+inf")
-        
+
         return output, lse
 
     b, s_q, h_q, d = q.size()
@@ -202,7 +202,7 @@ def reference_torch(
         lse_ref[i] = cur_lse
     out_ref = out_ref.to(torch.bfloat16)
     return out_ref, lse_ref
-    
+
 
 @torch.inference_mode()
 def test_flash_mla(t: TestParam):
@@ -235,7 +235,7 @@ def test_flash_mla(t: TestParam):
     def run_flash_mla():
         return flash_mla.flash_mla_with_kvcache(
             q,
-            blocked_k if not t.is_fp8 else blocked_k_quantized, # type: ignore
+            blocked_k if not t.is_fp8 else blocked_k_quantized,  # type: ignore
             block_table,
             cache_seqlens,
             t.dv,
@@ -248,27 +248,27 @@ def test_flash_mla(t: TestParam):
 
     out_ans, lse_ans = run_flash_mla()
     out_ref, lse_ref = reference_torch(cache_seqlens, block_table, q, blocked_k, t.dv, t.is_causal, abs_indices)
-    assert check_is_allclose("out", out_ans, out_ref, abs_tol=8e-4, rel_tol=2.01/128, cos_diff_tol=5e-6)
-    assert check_is_allclose("lse", lse_ans, lse_ref, abs_tol=1e-6, rel_tol=8.01/65536)
+    assert check_is_allclose("out", out_ans, out_ref, abs_tol=8e-4, rel_tol=2.01 / 128, cos_diff_tol=5e-6)
+    assert check_is_allclose("lse", lse_ans, lse_ref, abs_tol=1e-6, rel_tol=8.01 / 65536)
 
     if t.test_performance:
-        time_usage: float = triton.testing.do_bench(run_flash_mla)/1000  # type: ignore
+        time_usage: float = triton.testing.do_bench(run_flash_mla) / 1000  # type: ignore
         mean_attended_seqlens = cache_seqlens.float().mean().item() if t.topk is None else t.topk
-        compute_volume_flop = t.b*t.h_q*t.s_q*sum([
-            2*t.d*mean_attended_seqlens,   # Q * K^T
-            2*mean_attended_seqlens*t.dv,  # attention * V
+        compute_volume_flop = t.b * t.h_q * t.s_q * sum([
+            2 * t.d * mean_attended_seqlens,   # Q * K^T
+            2 * mean_attended_seqlens * t.dv,  # attention * V
         ])
         q_elem_size = torch.bfloat16.itemsize
-        kv_token_size = 656 if t.is_fp8 else t.d*torch.bfloat16.itemsize
-        memory_volume_B = t.b*sum([
-            t.s_q*t.h_q*(t.d*q_elem_size),    # Q
-            (t.s_q if t.topk is not None else 1) * mean_attended_seqlens*t.h_kv*kv_token_size,    # K/V
-            t.s_q*t.h_q*(t.dv*q_elem_size),   # Output
+        kv_token_size = 656 if t.is_fp8 else t.d * torch.bfloat16.itemsize
+        memory_volume_B = t.b * sum([
+            t.s_q * t.h_q * (t.d * q_elem_size),    # Q
+            (t.s_q if t.topk is not None else 1) * mean_attended_seqlens * t.h_kv * kv_token_size,    # K/V
+            t.s_q * t.h_q * (t.dv * q_elem_size),   # Output
         ])
         achieved_tflops = compute_volume_flop / time_usage / 1e12
         achieved_gBps = memory_volume_B / time_usage / 1e9
 
-        print(f"{time_usage*1000:.3f} ms, {achieved_tflops:.0f} TFLOPS, {achieved_gBps:.0f} GB/s")
+        print(f"{time_usage * 1000:.3f} ms, {achieved_tflops:.0f} TFLOPS, {achieved_gBps:.0f} GB/s")
 
 
 def main(torch_dtype):
@@ -324,7 +324,7 @@ def main(torch_dtype):
     cc_major, cc_minor = torch.cuda.get_device_capability()
     if cc_major == 10:
         testcases = [t for t in testcases if (t.is_fp8 and t.topk is not None)]
-    
+
     for testcase in testcases:
         test_flash_mla(testcase)
 

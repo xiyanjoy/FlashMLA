@@ -35,8 +35,8 @@ def generate_testcase(t: TestParam) -> Testcase:
     torch.manual_seed(t.seed)
     torch.cuda.manual_seed(t.seed)
     random.seed(t.seed)
-    q = torch.randn((t.b, t.s_q, t.h_q, t.d_qk), dtype=torch.bfloat16)/10
-    kv = torch.randn((t.b, t.s_kv, t.h_kv, t.d_qk), dtype=torch.bfloat16)/10
+    q = torch.randn((t.b, t.s_q, t.h_q, t.d_qk), dtype=torch.bfloat16) / 10
+    kv = torch.randn((t.b, t.s_kv, t.h_kv, t.d_qk), dtype=torch.bfloat16) / 10
 
     q.clamp_(-10, 10)
     kv.clamp_(-10, 10)
@@ -48,7 +48,7 @@ def generate_testcase(t: TestParam) -> Testcase:
                 # NOTE We use the following method to generate indices so that most indices lies within [s_kv-20000, s_kv), which is more realistic for sparse attention
                 near_mask = torch.randint(0, 32, (min(t.topk, t.s_kv),)) < 31
                 cur_indices = torch.randperm(t.s_kv)[:t.topk]
-                cur_indices[near_mask] = torch.randint(max(0, t.s_kv-20000), t.s_kv-1, (near_mask.sum().item(),))
+                cur_indices[near_mask] = torch.randint(max(0, t.s_kv - 20000), t.s_kv - 1, (near_mask.sum().item(),))
                 if len(cur_indices) < t.topk:
                     cur_indices = torch.cat([cur_indices, torch.full((t.topk - len(cur_indices),), 2147480000)])
                 cur_indices = cur_indices[torch.randperm(t.topk)]
@@ -72,9 +72,9 @@ def get_flop(p: TestParam) -> float:
 def reference_torch(p: TestParam, t: Testcase, sm_scale: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     def log2sumexp2(a: torch.Tensor, dim: int) -> torch.Tensor:
         return torch.logsumexp(a * math.log(2), dim=dim) * math.log2(math.e)
-    
+
     assert p.b == 1
-    indices = t.indices[0, :, 0, :] # [s_q, topk]
+    indices = t.indices[0, :, 0, :]  # [s_q, topk]
     invalid_indices_mask = (indices < 0) | (indices >= p.s_kv)
     qs = t.q[0, :, :, :].float()  # [s_q, h_q, d_qk]
     kvs = t.kv[0, :, 0, :].float()  # [s_kv, d_qk]
@@ -104,15 +104,15 @@ def run_test(p: TestParam) -> bool:
         return flash_mla_sparse_fwd(
             t.q.squeeze(0), t.kv.squeeze(0), t.indices.squeeze(0), sm_scale=sm_scale
         )
-    
+
     ans_out, ans_max_logits, ans_lse = run_ans()
     torch.cuda.synchronize()
 
     if p.benchmark:
         flop = get_flop(p)
-        prefill_ans_time: float = triton.testing.do_bench(run_ans, warmup=10, rep=20)/1000  # type: ignore
-        prefill_flops = flop/prefill_ans_time/1e12
-        print(f"Prefill:  {prefill_ans_time*1e6:4.0f} us, {prefill_flops:.3f} TFlops")
+        prefill_ans_time: float = triton.testing.do_bench(run_ans, warmup=10, rep=20) / 1000  # type: ignore
+        prefill_flops = flop / prefill_ans_time / 1e12
+        print(f"Prefill:  {prefill_ans_time * 1e6:4.0f} us, {prefill_flops:.3f} TFlops")
 
     if p.check_correctness:
         torch.cuda.synchronize()
@@ -120,9 +120,9 @@ def run_test(p: TestParam) -> bool:
         torch.cuda.synchronize()
 
         is_correct = True
-        is_correct &= check_is_allclose("out", ans_out, ref_out, abs_tol=8e-4, rel_tol=2.01/128, cos_diff_tol=7e-6)
-        is_correct &= check_is_allclose("max_logits", ans_max_logits, ref_max_logits, abs_tol=1e-6, rel_tol=2.01/65536)
-        is_correct &= check_is_allclose("lse", ans_lse, ref_lse, abs_tol=1e-6, rel_tol=2.01/65536)
+        is_correct &= check_is_allclose("out", ans_out, ref_out, abs_tol=8e-4, rel_tol=2.01 / 128, cos_diff_tol=7e-6)
+        is_correct &= check_is_allclose("max_logits", ans_max_logits, ref_max_logits, abs_tol=1e-6, rel_tol=2.01 / 65536)
+        is_correct &= check_is_allclose("lse", ans_lse, ref_lse, abs_tol=1e-6, rel_tol=2.01 / 65536)
 
         return is_correct
     else:
@@ -187,11 +187,10 @@ if __name__ == '__main__':
         is_correct = run_test(test)
         if not is_correct:
             failed_cases.append(test)
-    
+
     if len(failed_cases) > 0:
         print(f"\033[31m\033[1m{len(failed_cases)} / {len(testcases)} cases failed:\033[0m")
         for case in failed_cases:
             print(f"    {case}")
     else:
         print(f"\033[32m\033[1mAll {len(testcases)} cases passed!\033[0m")
-
