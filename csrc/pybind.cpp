@@ -41,7 +41,7 @@ struct Arch {
     }
 };
 
-// DecodingAttnImplMeta - A struct to hold metadata for Decoding Attention Implementation (i.e. Hopper Dense BF16, Hopper Sparse FP8, etc.)
+// DecodingAttnImplMeta - A struct to hold metadata for Decoding Attention Implementation (i.e. SM90 Dense BF16, SM90 Sparse FP8, etc.)
 struct DecodingAttnImplMeta {
     int num_sm_parts;
     int fixed_overhead_num_blocks;
@@ -334,7 +334,7 @@ fwd_kvcache_mla(
                 TORCH_CHECK(q_dtype == torch::kBFloat16, "Sparse FP8 MLA only supports BFloat16 on SM90");
                 sm90::run_flash_splitkv_mla_fp8_sparse_kernel(params, stream);
             } else {
-                TORCH_CHECK(false, "Dense FP8 MLA is not supported on SM90");
+                TORCH_CHECK(false, "Only FP8 kvcahe is supported for sparse MLA on SM90");
             }
         } else {
             if (is_fp8) {
@@ -347,7 +347,7 @@ fwd_kvcache_mla(
                     sm90::run_flash_splitkv_mla_kernel<cutlass::half_t>(params, stream);
 #endif
                 } else {
-                    TORCH_CHECK(false, "Unsupported tensor dtype for query");
+                    TORCH_CHECK(false, "Unsupported dtype for dense MLA on SM90");
                 }
             }
         }

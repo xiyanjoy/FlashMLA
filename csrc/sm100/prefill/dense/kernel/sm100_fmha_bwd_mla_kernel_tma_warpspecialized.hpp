@@ -953,7 +953,8 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
       TensorR const& regs,
       TensorC const& coord,
       TensorShape const& tensor_shape) {
-    //TODO Performance of FlashMLA on hopper is dropped with latest cutlass, so here revert the to the old version.
+  
+    // TODO: Performance of FlashMLA on sm90 is dropped with latest cutlass, so here revert the to the old version.
     // Tensor preds = cute::lazy::transform(coord, [&](auto const& c) { return elem_less(c, tensor_shape); });
 
     auto copy_op = make_cotiled_copy(
