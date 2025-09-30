@@ -176,7 +176,22 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, torch_dtyp
     max_seqlen_pad = triton.cdiv(max_seqlen, 256) * 256
     # print(f"{total_seqlens=}, {mean_seqlens=}, {max_seqlen=}")
 
-    q_float32 = torch.randn(b, s_q, h_q, d)
+    from pathlib import Path
+    tensor_dir = '/mnt/moonfs/xiexiaotong-m2/dump/20250910/1352/model.layers.20.self_attn.attn'
+    p = Path(tensor_dir)
+    tensor_decode_ql_nope_list = []
+    tensor_decode_q_pe_list = []
+    for file in p.rglob('*'):
+        tensor_dict = torch.load(file)
+        tensor_decode_ql_nope = tensor_dict["decode_ql_nope"]
+        tensor_decode_q_pe = tensor_dict["decode_q_pe"]
+        tensor_decode_ql_nope_list.append(tensor_decode_ql_nope)
+        tensor_decode_q_pe_list.append(tensor_decode_q_pe)
+    tensor_decode_ql_nope = torch.cat(tensor_decode_ql_nope_list, dim=0)
+    tensor_decode_q_pe = torch.cat(tensor_decode_q_pe_list, dim=0)
+    tensor = torch.cat([tensor_decode_ql_nope, tensor_decode_q_pe], dim=-1)
+    q_float32 = tensor[:b].unsqueeze(1).repeat(1, s_q, h_q//4, 1).to(torch.float32)
+    # q_float32 = torch.randn(b, s_q, h_q, d)
     block_size = 64
     block_table = torch.arange(
         b * max_seqlen_pad // block_size, dtype=torch.int32
@@ -257,7 +272,6 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, torch_dtyp
     out_torch, lse_torch = fake_fp8()
     cal_diff(out_flash.to(out_torch.dtype), out_torch, "out", use_fp8)
     cal_diff(lse_flash.to(lse_torch.dtype), lse_torch, "lse")
-    import pdb; pdb.set_trace()
 
     t = triton.testing.do_bench(flash_mla)
     FLOPS = s_q * total_seqlens * h_q * (d + dv) * 2
