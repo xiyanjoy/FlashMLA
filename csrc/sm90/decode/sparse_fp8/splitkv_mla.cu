@@ -119,6 +119,18 @@ __forceinline__ __device__ void scale_softmax(
         *(float2*)(sScale + 2*(idx_in_warpgroup/4)) = *(float2*)(scale_for_olds);
 }
 
+// A helper function for determining the length of the causal mask for one q token
+__forceinline__ __device__ int get_mask_len(const DecodingParams &params, int m_block_idx, int local_seq_q_idx) {
+    int global_seq_q_idx = m_block_idx*BLOCK_M + local_seq_q_idx;
+    if (global_seq_q_idx < params.q_seq_per_hk) {
+        int s_q_idx = global_seq_q_idx / params.q_head_per_hk;
+        return params.s_q - s_q_idx - 1;
+    } else {
+        // Out-of-bound request, regard as no masks
+        return 0;
+    }
+}
+
 template<bool IS_SPARSE, typename TmaParams>
 __global__ void __launch_bounds__(NUM_THREADS, 1, 2)
 flash_fwd_splitkv_mla_fp8_kernel(__grid_constant__ const DecodingParams params, __grid_constant__ const TmaParams tma_params) {
@@ -214,6 +226,37 @@ flash_fwd_splitkv_mla_fp8_kernel(__grid_constant__ const DecodingParams params, 
         #pragma unroll 1
         for (int batch_idx = begin_idx; batch_idx <= end_idx; ++batch_idx) {
             auto [start_block_idx, end_block_idx, is_no_split, seqlen_k] = get_cur_req_info(batch_idx);
+
+            int rRightBorderForQSeq[2];
+            if (params.is_causal) {
+                // The causal mask looks like:
+                // XXXX
+                // XXXX
+                // ...
+                // XXXX
+                //  XXX
+                //  XXX
+                //  ...
+                //  XXX
+                //   XX
+                //   XX
+                //  ...
+                //   XX
+                // Firstly, there is a common_mask_len, which is the minimum length of causal masks among all tokens. Since the length of the causal mask decreases monotonically, the common_mask_len is the length of the causal mask for the last token. We consider the common_mask_len as a "reduction in the length of the k-sequence.", and adjust end_block_idx based on it, to save some calculation.
+                // Besides, a token may have some extra masks other than the common mask. We use rRightBorderForQSeq to denote it, which means the right border of the k-sequence for the particular q token. In this way, (seqlen_k-common_mask_len) - rRightBorderForQSeq < 64 holds, which means that we only need to apply the causal mask to the last two KV blocks
+                // NOTE This may lead to start_block_idx >= end_block_idx which needs some special handling
+                int common_mask_len = get_mask_len(params, head_block_idx, BLOCK_M-1);
+                int last_block_in_seq = cute::ceil_div(seqlen_k-common_mask_len, int(PAGE_BLOCK_SIZE));
+                end_block_idx = batch_idx == end_idx ? min(sched_end_block_idx, last_block_in_seq) : last_block_in_seq;
+
+                CUTLASS_PRAGMA_UNROLL
+                for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
+                    int row_idx = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
+                    rRightBorderForQSeq[local_row_idx] = min(seqlen_k-get_mask_len(params, head_block_idx, row_idx), end_block_idx*PAGE_BLOCK_SIZE);
+                }
+            } else {
+                rRightBorderForQSeq[0] = rRightBorderForQSeq[1] = seqlen_k;
+            }
 
             rL[0] = rL[1] = 0.0f;
             rM[0] = rM[1] = MAX_INIT_VAL;
