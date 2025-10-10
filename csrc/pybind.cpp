@@ -76,8 +76,16 @@ DecodingAttnImplMeta get_attn_impl_meta(
             }
         } else {
             if (is_fp8_kvcache) {
-                // Dense FP8 MLA
-                TORCH_CHECK(false, "Dense FP8 MLA is not supported on SM90");
+                TORCH_CHECK(h_q_.has_value());
+                int h_q = h_q_.value();
+                TORCH_CHECK(h_q % h_k == 0);
+                int s_q = num_q_tokens_per_head_k * h_k / h_q;
+                // FP8 + Dense MLA
+                return {
+                    std::max((sm_count/2) / h_k / (cutlass::ceil_div(h_q/h_k, 2*64) * s_q), 1),
+                    5,
+                    64
+                };
             } else {
                 // Dense BF16 MLA
                 return {
@@ -338,7 +346,8 @@ fwd_kvcache_mla(
             }
         } else {
             if (is_fp8) {
-                TORCH_CHECK(false, "Dense FP8 MLA is not supported on SM90");
+                TORCH_CHECK(q_dtype == torch::kBFloat16, "Dense FP8 MLA only supports BFloat16 on SM90");
+                sm90::run_flash_splitkv_mla_fp8_dense_kernel(params, stream);
             } else {
                 if (q_dtype == torch::kBFloat16) {
                     sm90::run_flash_splitkv_mla_kernel<cutlass::bfloat16_t>(params, stream);

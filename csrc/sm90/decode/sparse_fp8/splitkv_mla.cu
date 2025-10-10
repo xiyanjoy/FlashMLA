@@ -119,9 +119,9 @@ __forceinline__ __device__ void scale_softmax(
         *(float2*)(sScale + 2*(idx_in_warpgroup/4)) = *(float2*)(scale_for_olds);
 }
 
-template<typename TmaParams>
+template<bool IS_SPARSE, typename TmaParams>
 __global__ void __launch_bounds__(NUM_THREADS, 1, 2)
-flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const DecodingParams params, __grid_constant__ const TmaParams tma_params) {
+flash_fwd_splitkv_mla_fp8_kernel(__grid_constant__ const DecodingParams params, __grid_constant__ const TmaParams tma_params) {
 #if IS_SM90
     const int head_block_idx = blockIdx.x;
     const int s_q_idx = blockIdx.y;
@@ -188,13 +188,14 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const DecodingParams p
 
     cute::cluster_wait();   // Wait for barriers from the other CTA to be ready
 
-    auto get_cur_req_info = [&](int batch_idx) -> std::tuple<int, int, bool> {
-        constexpr int kBlockN = TOPK_BLOCK_SIZE;
+    auto get_cur_req_info = [&](int batch_idx) -> std::tuple<int, int, bool, int> {
+        int seqlen_k = IS_SPARSE ? params.topk : __ldg(params.seqlens_k_ptr + batch_idx);
+        constexpr int kBlockN = IS_SPARSE ? TOPK_BLOCK_SIZE : PAGE_BLOCK_SIZE;
         const int start_block_idx = batch_idx == begin_idx ? sched_begin_block_idx : 0;
         // NOTE TopK attention has nothing to do with causal mask and sliding window
-        int end_block_idx = batch_idx == end_idx ? sched_end_block_idx : cute::ceil_div(params.topk, kBlockN);
-        const bool is_no_split = start_block_idx == 0 && end_block_idx == cute::ceil_div(params.topk, kBlockN);
-        return {start_block_idx, end_block_idx, is_no_split};
+        int end_block_idx = batch_idx == end_idx ? sched_end_block_idx : cute::ceil_div(seqlen_k, kBlockN);
+        const bool is_no_split = start_block_idx == 0 && end_block_idx == cute::ceil_div(seqlen_k, kBlockN);
+        return {start_block_idx, end_block_idx, is_no_split, seqlen_k};
     };
 
     if (warpgroup_idx == 0) {
@@ -212,7 +213,7 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const DecodingParams p
 
         #pragma unroll 1
         for (int batch_idx = begin_idx; batch_idx <= end_idx; ++batch_idx) {
-            auto [start_block_idx, end_block_idx, is_no_split] = get_cur_req_info(batch_idx);
+            auto [start_block_idx, end_block_idx, is_no_split, seqlen_k] = get_cur_req_info(batch_idx);
 
             rL[0] = rL[1] = 0.0f;
             rM[0] = rM[1] = MAX_INIT_VAL;
@@ -358,7 +359,7 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const DecodingParams p
 
         #pragma unroll 1
         for (int batch_idx = begin_idx; batch_idx <= end_idx; ++batch_idx) {
-            auto [start_block_idx, end_block_idx, is_no_split] = get_cur_req_info(batch_idx);
+            auto [start_block_idx, end_block_idx, is_no_split, seqlen_k] = get_cur_req_info(batch_idx);
             cute::fill(rO, 0.);
 
             CUTE_NO_UNROLL
@@ -445,10 +446,14 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const DecodingParams p
         
         CUTE_NO_UNROLL
         for (int batch_idx = begin_idx; batch_idx <= end_idx; ++batch_idx) {
-            auto [start_block_idx, end_block_idx, is_no_split] = get_cur_req_info(batch_idx);
+            auto [start_block_idx, end_block_idx, is_no_split, seqlen_k] = get_cur_req_info(batch_idx);
             int* gIndices = params.indices_ptr + batch_idx*params.indices_batch_stride + s_q_idx*params.indices_row_stride; // (topk) : (1)
+            int* block_table_ptr = params.block_table + batch_idx*params.block_table_batch_stride;	// (/) : (1)
             
-            #define GET_TOKEN_INDEX(block_idx) __ldg(gIndices + (block_idx)*TOPK_BLOCK_SIZE + idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx)
+            #define GET_TOKEN_INDEX(block_idx) \
+                IS_SPARSE ? \
+                    __ldg(gIndices + (block_idx)*TOPK_BLOCK_SIZE + idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx) : \
+                    __ldg(block_table_ptr + block_idx) * PAGE_BLOCK_SIZE + idx_in_cluster*(PAGE_BLOCK_SIZE/2) + my_token_idx
             int nxt_token_index = GET_TOKEN_INDEX(start_block_idx);
 
             CUTE_NO_UNROLL
@@ -461,6 +466,7 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const DecodingParams p
                 
                 transac_bar_t* peer_bar_k_remote_ready = get_peer_addr(&(plan.bar_k_remote_ready[buf_idx]));
                 int token_index = nxt_token_index;
+                if (!IS_SPARSE && (token_index % PAGE_BLOCK_SIZE) + block_idx * PAGE_BLOCK_SIZE >= seqlen_k) token_index = -1;
                 if (block_idx+1 != end_block_idx)
                     nxt_token_index = GET_TOKEN_INDEX(block_idx+1);
                 int block_index = token_index/PAGE_BLOCK_SIZE;
@@ -518,8 +524,13 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const DecodingParams p
 
                 if (idx_in_warpgroup < 32) {
                     // We put this after fence_view_async_shared() since this won't be read by async proxy
-                    int2 indices = __ldg((int2*)(gIndices + block_idx*TOPK_BLOCK_SIZE + lane_idx*2));
-                    *(char2*)(&plan.is_kv_valid[buf_idx][lane_idx*2]) = {indices.x != -1, indices.y != -1};
+                    if constexpr (IS_SPARSE) {
+                        int2 indices = __ldg((int2*)(gIndices + block_idx*TOPK_BLOCK_SIZE + lane_idx*2));
+                        *(char2*)(&plan.is_kv_valid[buf_idx][lane_idx*2]) = {indices.x != -1, indices.y != -1};
+                    } else {
+                        int indices = seqlen_k - block_idx * PAGE_BLOCK_SIZE - lane_idx*2;
+                        *(char2*)(&plan.is_kv_valid[buf_idx][lane_idx*2]) = {indices > 0, indices - 1 > 0};
+                    }
                 }
 
                 // Signal the barrier
@@ -579,7 +590,75 @@ void run_flash_splitkv_mla_fp8_sparse_kernel(DecodingParams &params, cudaStream_
         shape_Q, tma_Q,
         shape_O, tma_O
     };
-    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<decltype(tma_params)>;
+    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_kernel<true, decltype(tma_params)>;
+
+    constexpr size_t smem_size = sizeof(SharedMemoryPlan);
+    CHECK_CUDA(cudaFuncSetAttribute(mla_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
+    const int num_m_block = cute::ceil_div(params.q_head_per_hk, 2*BLOCK_M) * 2;
+    // NOTE Don't use PDL because of potential compiler bugs!
+    // cudaLaunchAttribute mla_kernel_attributes[1];
+    // mla_kernel_attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    // mla_kernel_attributes[0].val.programmaticStreamSerializationAllowed = 1;
+    // cudaLaunchConfig_t mla_kernel_config = {
+    //     dim3(num_m_block, params.h_k, params.num_sm_parts),
+    //     dim3(NUM_THREADS, 1, 1),
+    //     smem_size,
+    //     stream,
+    //     mla_kernel_attributes,
+    //     1
+    // };
+    // cudaLaunchKernelEx(&mla_kernel_config, mla_kernel, params, tma_params);
+    cutlass::ClusterLaunchParams launch_params = {
+        dim3(num_m_block, params.s_q, params.num_sm_parts),
+        dim3(NUM_THREADS, 1, 1),
+        dim3(2, 1, 1),
+        smem_size,
+        stream
+    };
+    cutlass::launch_kernel_on_cluster(
+        launch_params, (void*)mla_kernel, params, tma_params
+    );
+    CHECK_CUDA_KERNEL_LAUNCH();
+}
+
+void run_flash_splitkv_mla_fp8_dense_kernel(DecodingParams &params, cudaStream_t stream) {
+    FLASH_ASSERT(params.h_k == 1);
+
+    auto shape_Q = make_shape(params.q_head_per_hk, params.d, params.s_q, params.b);
+    auto tma_Q = cute::make_tma_copy(
+        SM90_TMA_LOAD{},
+        make_tensor(
+            make_gmem_ptr((bf16*)params.q_ptr),
+            make_layout(
+                shape_Q,
+                make_stride(params.q_row_stride, _1{}, params.q_head_per_hk*params.q_row_stride, params.q_batch_stride)
+            )
+        ),
+        SmemLayoutQ{}
+    );
+
+    auto shape_O = make_shape(params.q_head_per_hk, params.d_v, params.s_q, params.b);
+    auto tma_O = cute::make_tma_copy(
+        SM90_TMA_STORE{},
+        make_tensor(
+            make_gmem_ptr((bf16*)params.o_ptr),
+            make_layout(
+                shape_O,
+                make_stride(params.o_row_stride, _1{}, params.q_head_per_hk*params.o_row_stride, params.o_batch_stride)
+            )
+        ),
+        SmemLayoutOBuf{}
+    );
+
+    TmaParams<
+        decltype(shape_Q), decltype(tma_Q),
+        decltype(shape_O), decltype(tma_O)
+    > tma_params = {
+        shape_Q, tma_Q,
+        shape_O, tma_O
+    };
+    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_kernel<false, decltype(tma_params)>;
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     CHECK_CUDA(cudaFuncSetAttribute(mla_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
