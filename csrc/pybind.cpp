@@ -3,7 +3,7 @@
  * Copyright (c) 2024, Tri Dao.
  ******************************************************************************/
 
-#include <torch/python.h>
+// #include <torch/python.h>
 #include <torch/nn/functional.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -472,11 +472,11 @@ std::vector<at::Tensor> sparse_prefill_fwd(
 
 
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "FlashMLA";
-    m.def("get_mla_decoding_metadata", &get_mla_decoding_metadata);
-    m.def("fwd_kvcache_mla", &fwd_kvcache_mla);
-    m.def("dense_prefill_fwd", &FMHACutlassSM100FwdRun);
-    m.def("dense_prefill_bwd", &FMHACutlassSM100BwdRun);
-    m.def("sparse_prefill_fwd", &sparse_prefill_fwd);
-}
+// PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+//     m.doc() = "FlashMLA";
+//     m.def("get_mla_decoding_metadata", &get_mla_decoding_metadata);
+//     m.def("fwd_kvcache_mla", &fwd_kvcache_mla);
+//     m.def("dense_prefill_fwd", &FMHACutlassSM100FwdRun);
+//     m.def("dense_prefill_bwd", &FMHACutlassSM100BwdRun);
+//     m.def("sparse_prefill_fwd", &sparse_prefill_fwd);
+// }
