@@ -16,6 +16,7 @@
 #include "sm90/decode/dense/splitkv_mla.h"
 #include "sm90/decode/sparse_fp8/splitkv_mla.h"
 #include "sm90/prefill/sparse/fwd.h"
+#include "sm100/decode/dense/splitkv_mla.h"
 #include "sm100/decode/sparse_fp8/splitkv_mla.h"
 #include "sm100/prefill/dense/interface.h"
 #include "sm100/prefill/sparse/fwd.h"
@@ -109,8 +110,12 @@ DecodingAttnImplMeta get_attn_impl_meta(
                 // FP8 MLA
                 TORCH_CHECK(false, "FP8 Dence MLA is not supported on SM100");
             } else {
-                // Normal BF16 MLA
-                TORCH_CHECK(false, "BF16 Dence MLA is not supported on SM100");
+                // Dense BF16 MLA
+                return {
+                    std::max(sm_count / h_k / cutlass::ceil_div(num_q_tokens_per_head_k, 64), 1),
+                    5,
+                    64
+                };
             }
         }
     } else {
@@ -352,8 +357,13 @@ fwd_kvcache_mla(
             }
         }
     } else if (arch.is_sm100()) {
-        TORCH_CHECK(is_fp8 && is_sparse_attn, "Only FP8 + Sparse attention is supported on SM100");
-        sm100::run_flash_splitkv_mla_fp8_sparse_kernel(params, stream);
+        if (is_sparse_attn) {
+            TORCH_CHECK(is_fp8 && is_sparse_attn, "Only FP8 + Sparse attention is supported on SM100");
+            sm100::run_flash_splitkv_mla_fp8_sparse_kernel(params, stream);
+        } else {
+            TORCH_CHECK(!is_fp8, "FP8 + Dense attention isn't supported on SM100");
+            sm100::run_flash_splitkv_mla_dense_kernel(params, stream);
+        }
     } else {
         TORCH_CHECK(false, "Unsupported GPU architecture");
     }

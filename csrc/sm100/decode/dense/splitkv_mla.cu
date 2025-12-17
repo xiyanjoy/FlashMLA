@@ -7,7 +7,6 @@
 #include <cute/arch/tmem_allocator_sm100.hpp>
 
 #include "utils.h"
-#include "dequant.h"
 #include "sm100/defines.h"
 #include "sm100/helpers.h"
 #include "sm100/intrinsics.h"
@@ -42,6 +41,20 @@ namespace tmem_addr {
     constexpr int p = 256;  // p: [256, 288]
 };
 
+template<typename PrecType, int DIM, int DIM2 = DIM>
+constexpr auto getSmemLayoutK() {
+    constexpr int headSizeBytes = sizeof(PrecType) * DIM;
+    constexpr int headSizeBytes2 = sizeof(PrecType) * DIM2;
+
+    if constexpr (headSizeBytes % 128 == 0 && headSizeBytes2 % 128 == 0) {
+        return UMMA::Layout_K_SW128_Atom<PrecType>{};
+    } else if constexpr (headSizeBytes % 64 == 0 && headSizeBytes2 % 64 == 0) {
+        return UMMA::Layout_K_SW64_Atom<PrecType>{};
+    } else {
+        return UMMA::Layout_K_SW32_Atom<PrecType>{};
+    }
+}
+
 using SmemLayoutQ = decltype(coalesce(tile_to_shape(
     UMMA::Layout_K_SW128_Atom<bf16>{},
     Shape<Int<B_H>, Int<D_K>>{},
@@ -64,24 +77,31 @@ using SmemLayoutS = decltype(tile_to_shape(
     Step<_1, _2>{}
 ));
 
-template<int NUM_TILES>
-using SmemLayoutKTiles = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_K_INTER_Atom<bf16>{},
-    Shape<Int<B_H>, Int<64*NUM_TILES>>{},
-    Step<_1, _2>{}
-), Shape<_1, _1>{}));
+using SmemLayoutK = decltype(tile_to_shape(
+        getSmemLayoutK<bf16, D_K, D_V>(),
+        Shape<Int<B_TOPK>, Int<D_K>>{}));
 
-template<int NUM_TILES>
-using SmemLayoutKTilesTransposed = decltype(composition(
-    SmemLayoutKTiles<NUM_TILES>{},
-    Layout<
-        Shape<Int<64*NUM_TILES>, Int<B_TOPK>>,
-        Stride<Int<B_TOPK>, _1>
-    >{}
-));
+using SmemLayoutV = decltype(tile_to_shape(
+        getSmemLayoutK<bf16, D_K, D_V>(),
+        Shape<Int<B_TOPK>, Int<D_V>>{}));
+using SmemLayoutVtransposed = decltype(composition(SmemLayoutV{}, make_layout(Shape<Int<D_V>, Int<B_TOPK>>{}, GenRowMajor{})));
 
-using SmemLayoutK = SmemLayoutKTiles<9>;
-using SmemLayoutV = SmemLayoutKTilesTransposed<8>;
+using index_t = int64_t;
+static constexpr int kBlockKSmem = 64;
+static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(bf16);  // 8 elements
+static_assert(D_K % kGmemElemsPerLoad == 0, "kHeadDim must be a multiple of kGmemElemsPerLoad");
+static constexpr int kGmemThreadsPerRow = kBlockKSmem / kGmemElemsPerLoad;  // 8 threads
+using Gmem_copy_struct = SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>;
+static constexpr int kNThreadsLoad = 128;
+static_assert(kNThreadsLoad % kGmemThreadsPerRow == 0, "kNThreads must be a multiple of kGmemThreadsPerRow");
+
+using GmemLayoutAtom = Layout<
+        Shape<Int<kNThreadsLoad / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
+        Stride<Int<kGmemThreadsPerRow>, _1>>;
+using GmemTiledCopy = decltype(make_tiled_copy(
+        Copy_Atom<Gmem_copy_struct, bf16>{},
+        GmemLayoutAtom{},
+        Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
 
 struct SharedMemoryPlan {
     array_aligned<bf16, cosize_v<SmemLayoutQ>> q;
@@ -95,7 +115,6 @@ struct SharedMemoryPlan {
     transac_bar_t bar_k_ready[NUM_BUFS], bar_k_free[NUM_BUFS];
     transac_bar_t bar_qk_done[NUM_BUFS], bar_so_ready[NUM_BUFS];
     float rowwise_max_buf[128], rowwise_li_buf[128];
-    bool is_token_valid[NUM_BUFS][B_TOPK];
     array_aligned<uint32_t, 1> tmem_start_addr;
 };
 
@@ -117,12 +136,43 @@ void store_128b(void* smem_ptr, const T &data) {
     *(__int128*)smem_ptr = *(__int128*)&data;
 }
 
+template <bool Is_even_MN=true, bool Is_even_K=true, bool Clear_OOB_MN=false, bool Clear_OOB_K=true,
+          typename TiledCopy, typename Engine0, typename Layout0, typename Engine1, typename Layout1,
+          typename Engine2, typename Layout2, typename Engine3, typename Layout3>
+__forceinline__ __device__ void flash_copy(TiledCopy tiled_copy, Tensor<Engine0, Layout0> const &S,
+                            Tensor<Engine1, Layout1> &D, Tensor<Engine2, Layout2> const &identity_MN,
+                            Tensor<Engine3, Layout3> const &predicate_K, const int max_MN=0) {
+    CUTE_STATIC_ASSERT_V(rank(S) == Int<3>{});
+    CUTE_STATIC_ASSERT_V(rank(D) == Int<3>{});
+    CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D));                     // MMA
+    CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(D));                     // MMA_M
+    CUTE_STATIC_ASSERT_V(size<2>(S) == size<2>(D));                     // MMA_K
+    // There's no case where !Clear_OOB_K && Clear_OOB_MN
+    static_assert(!(Clear_OOB_MN && !Clear_OOB_K));
+    #pragma unroll
+    for (int m = 0; m < size<1>(S); ++m) {
+        if (Is_even_MN || get<0>(identity_MN(0, m, 0)) < max_MN) {
+            #pragma unroll
+            for (int k = 0; k < size<2>(S); ++k) {
+                if (Is_even_K || predicate_K(k)) {
+                    cute::copy(tiled_copy, S(_, m, k), D(_, m, k));
+                } else if (Clear_OOB_K) {
+                    cute::clear(D(_, m, k));
+                }
+            }
+        } else if (Clear_OOB_MN) {
+            cute::clear(D(_, m, _));
+        }
+    }
+}
+
 template<typename TmaParams>
 __global__ void __launch_bounds__(NUM_THREADS, 1, 1)
-flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const DecodingParams params, __grid_constant__ const TmaParams tma_params) {
+flash_fwd_splitkv_mla_dense_kernel(__grid_constant__ const DecodingParams params, __grid_constant__ const TmaParams tma_params) {
 #if IS_SM100
     const int head_block_idx = blockIdx.x;
     const int s_q_idx = blockIdx.y;
+    const int bidh = blockIdx.y;
     const int partition_idx = blockIdx.z;
     const int warpgroup_idx = cutlass::canonical_warp_group_idx();
     const int idx_in_warpgroup = threadIdx.x % 128;
@@ -170,30 +220,37 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const DecodingParams p
         return;
     }
 
-    auto get_cur_req_info = [&](int batch_idx) -> std::tuple<int, int, bool> {
+    auto get_cur_req_info = [&](int batch_idx) -> std::tuple<int, int, int, bool> {
+        constexpr int kBlockN = B_TOPK;
+        int seqlen_k = __ldg(params.seqlens_k_ptr + batch_idx);
         int start_block_idx = batch_idx == begin_idx ? sched_begin_block_idx : 0;
-        int end_block_idx = batch_idx == end_idx ? sched_end_block_idx : params.topk / B_TOPK;
-        bool is_no_split = start_block_idx == 0 && end_block_idx == params.topk / B_TOPK;
-        return {start_block_idx, end_block_idx, is_no_split};
+        int end_block_idx = batch_idx == end_idx ? sched_end_block_idx : cute::ceil_div(seqlen_k, kBlockN);
+        bool is_no_split = start_block_idx == 0 && end_block_idx == cute::ceil_div(seqlen_k, kBlockN);
+        return {seqlen_k, start_block_idx, end_block_idx, is_no_split};
     };
 
     if (warpgroup_idx == 0) {
         // Producer warpgroup
+        cutlass::arch::warpgroup_reg_dealloc<152>();
 
         #pragma unroll 1
         for (int batch_idx = begin_idx; batch_idx <= end_idx; ++batch_idx) {
-            auto [start_block_idx, end_block_idx, is_no_split] = get_cur_req_info(batch_idx);
-            int* gIndices = params.indices_ptr + batch_idx*params.indices_batch_stride + s_q_idx*params.indices_row_stride; // (topk) : (1)
+            auto [seqlen_k, start_block_idx, end_block_idx, is_no_split] = get_cur_req_info(batch_idx);
 
-            constexpr int GROUP_SIZE = 4, NUM_GROUPS = 128 / GROUP_SIZE;
-            constexpr int ROWS_PER_GROUP = B_TOPK / NUM_GROUPS;
-            int group_idx = idx_in_warpgroup / GROUP_SIZE;
-            int idx_in_group = idx_in_warpgroup % GROUP_SIZE;
+            int *block_table = params.block_table + batch_idx * params.block_table_batch_stride;
+            const index_t row_offset_k = bidh * params.k_head_stride;
+            Tensor gK = make_tensor(make_gmem_ptr(reinterpret_cast<bf16 *>(params.k_ptr) + row_offset_k),
+                                    Shape<Int<B_TOPK>, Int<D_K>>{},
+                                    make_stride(params.k_row_stride, _1{}));
+            GmemTiledCopy gmem_tiled_copy_K;
+            auto gmem_thr_copy_K = gmem_tiled_copy_K.get_thread_slice(idx_in_warpgroup);
+            Tensor tKgK = gmem_thr_copy_K.partition_S(gK);
 
             NamedBarrier::arrive_and_wait(NUM_WORKING_THREADS, 1);
 
             CUTE_NO_UNROLL
             for (int block_idx = start_block_idx; block_idx < end_block_idx; block_idx++) {
+                int cur_block_table = __ldg(&block_table[block_idx]);
                 int buf_idx = block_idx % NUM_BUFS;
 
                 // Wait for buffer to be available
@@ -201,53 +258,20 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const DecodingParams p
 
                 // Load
                 Tensor sK = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data()), SmemLayoutK{});
+                Tensor tKsK = gmem_thr_copy_K.partition_D(sK);
+                Tensor cK = make_identity_tensor(make_shape(size<0>(sK), size<1>(sK)));  // (BLK_N,BLK_K) -> (blk_n,blk_k)
+                Tensor tKcK = gmem_thr_copy_K.partition_S(cK);  // (BCPY,BCPY_N,BCPY_K) -> (blk_n,blk_k)
+                Tensor tKpK = make_tensor<bool>(make_shape(size<2>(tKsK)));
 
-                CUTE_UNROLL
-                for (int local_row = 0; local_row < ROWS_PER_GROUP; ++local_row) {
-                    int smem_row = group_idx + local_row*NUM_GROUPS;
-                    int token_index = __ldg(gIndices + block_idx*B_TOPK + smem_row);
-                    bool is_token_invalid = token_index == -1;
-                    if (idx_in_group == 0)
-                        plan.is_token_valid[buf_idx][smem_row] = !is_token_invalid;
-                    if (is_token_invalid) {
-                        uint128_t zeros = uint128_t{};
-                        CUTE_UNROLL
-                        for (int local_col = 0; local_col < D_V / (GROUP_SIZE*16); ++local_col) {
-                            int col_base = local_col*(GROUP_SIZE*16) + idx_in_group*16;
-                            store_128b(&sK(smem_row, col_base  ), zeros);
-                            store_128b(&sK(smem_row, col_base+8), zeros);
-                        }
-                        CUTE_UNROLL
-                        for (int local_col = 0; local_col < (D_K-D_V) / (GROUP_SIZE*8); ++local_col) {
-                            int col_base = local_col*(GROUP_SIZE*8) + idx_in_group*8;
-                            store_128b(&sK(smem_row, D_V+col_base), zeros);
-                        }
-                    } else {
-                        int block_index = token_index/B_TOPK;
-                        int rel_idx_in_block = (token_index+B_TOPK) % B_TOPK;   // NOTE When token_index is -1, -1/B_TOPK = 0 and (-1+B_TOPK)%B_TOPK = 63, so there will be no illegal-memory-access error. However, masking is necessary to prevent NaN (TODO Skip some rows instead?) TODO Masking
-                        fp8* gK_base = (fp8*)params.k_ptr + block_index*params.k_batch_stride + rel_idx_in_block*params.k_row_stride;
-                        float4 scales = __ldg((float4*)(gK_base + D_V));
-
-                        CUTE_UNROLL
-                        for (int local_col = 0; local_col < D_V / (GROUP_SIZE*16); ++local_col) {
-                            int col_base = local_col*(GROUP_SIZE*16) + idx_in_group*16;
-                            fp8x16 cur_fp8s = ldg_128_fp8x16(gK_base + col_base);
-                            float cur_scale = local_col < (256/(GROUP_SIZE*16)) ?
-                                (local_col < (128/(GROUP_SIZE*16)) ? scales.x : scales.y) :
-                                (local_col < (384/(GROUP_SIZE*16)) ? scales.z : scales.w);
-                            store_128b(&sK(smem_row, col_base  ), cvt_fp8x8_bf16x8(cur_fp8s.a0, cur_scale));
-                            store_128b(&sK(smem_row, col_base+8), cvt_fp8x8_bf16x8(cur_fp8s.a1, cur_scale));
-                        }
-
-                        CUTE_UNROLL
-                        for (int local_col = 0; local_col < (D_K-D_V) / (GROUP_SIZE*8); ++local_col) {
-                            int col_base = local_col*(GROUP_SIZE*8) + idx_in_group*8;
-                            fp8x16 cur_k_rope_fp8s = ldg_128_fp8x16(gK_base + D_V + 4*sizeof(float) + col_base*sizeof(bf16));
-                            bf16x8 cur_k_rope = *reinterpret_cast<bf16x8*>(&cur_k_rope_fp8s);
-                            store_128b(&sK(smem_row, D_V+col_base), cur_k_rope);
-                        }
-                    }
-                }
+                // We need to clear the sK smem tiles because K is V.
+                const index_t offset_k = cur_block_table * params.k_batch_stride;
+                tKgK.data() = tKgK.data() + offset_k;
+                const int max_MN = seqlen_k - block_idx * B_TOPK;
+                flash_copy</*Is_even_MN=*/false, /*Is_even_K=*/true, /*Clear_OOB_MN=*/true>(gmem_tiled_copy_K, tKgK, tKsK, tKcK, tKpK,
+                                                                                            max_MN);
+                tKgK.data() = tKgK.data() + -offset_k;
+                cp_async_fence();
+                cp_async_wait<0>();
 
                 fence_view_async_shared();
 
@@ -265,7 +289,7 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const DecodingParams p
 
         #pragma unroll 1
         for (int batch_idx = begin_idx; batch_idx <= end_idx; ++batch_idx) {
-            auto [start_block_idx, end_block_idx, is_no_split] = get_cur_req_info(batch_idx);
+            auto [seqlen_k, start_block_idx, end_block_idx, is_no_split] = get_cur_req_info(batch_idx);
 
             NamedBarrier::arrive_and_wait(NUM_WORKING_THREADS, 1);
 
@@ -287,10 +311,11 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const DecodingParams p
                 cutlass::arch::fence_view_async_tmem_load();
 
                 // Get rowwise max
+                const int max_MN = seqlen_k - block_idx * B_TOPK;
                 float cur_max = -INFINITY;
                 CUTE_UNROLL
                 for (int i = 0; i < B_TOPK/2; ++i) {
-                    if (!plan.is_token_valid[buf_idx][(idx_in_warpgroup/64)*(B_TOPK/2)+i]) p[i] = -INFINITY;
+                    if ((idx_in_warpgroup/64)*(B_TOPK/2)+i >= max_MN) p[i] = -INFINITY;
                     cur_max = max(cur_max, p[i]);
                 }
                 cur_max *= params.scale_softmax_log2;
@@ -481,7 +506,7 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const DecodingParams p
             
             #pragma unroll 1
             for (int batch_idx = begin_idx; batch_idx <= end_idx; ++batch_idx) {
-                auto [start_block_idx, end_block_idx, is_no_split] = get_cur_req_info(batch_idx);
+                auto [seqlen_k, start_block_idx, end_block_idx, is_no_split] = get_cur_req_info(batch_idx);
 
                 if (elect_one_sync()) {
                     // Copy Q
@@ -517,7 +542,7 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const DecodingParams p
                         // Wait for S
                         plan.bar_so_ready[buf_idx].wait(bar_phase_k>>buf_idx&1);
                         tcgen05_after_thread_sync();
-                        Tensor sV = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data()), SmemLayoutV{});
+                        Tensor sV = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data()), SmemLayoutVtransposed{});
 
                         // Issue O += S @ V
                         utcmma_ss(tiled_mma_sv, sS, sV, tO, block_idx == start_block_idx);
@@ -541,9 +566,8 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const DecodingParams p
 #endif
 }
 
-void run_flash_splitkv_mla_fp8_sparse_kernel(DecodingParams &params, cudaStream_t stream) {
+void run_flash_splitkv_mla_dense_kernel(DecodingParams &params, cudaStream_t stream) {
     FLASH_ASSERT(params.h_k == 1);
-    FLASH_ASSERT(params.topk % B_TOPK == 0);
 
     auto shape_Q = make_shape(params.q_head_per_hk, params.d, params.s_q, params.b);
     auto tma_Q = cute::make_tma_copy(
@@ -578,7 +602,7 @@ void run_flash_splitkv_mla_fp8_sparse_kernel(DecodingParams &params, cudaStream_
         shape_Q, tma_Q,
         shape_O, tma_O
     };
-    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<decltype(tma_params)>;
+    auto mla_kernel = &flash_fwd_splitkv_mla_dense_kernel<decltype(tma_params)>;
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     CHECK_CUDA(cudaFuncSetAttribute(mla_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
