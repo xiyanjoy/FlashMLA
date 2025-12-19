@@ -172,7 +172,6 @@ flash_fwd_splitkv_mla_dense_kernel(__grid_constant__ const DecodingParams params
 #if IS_SM100
     const int head_block_idx = blockIdx.x;
     const int s_q_idx = blockIdx.y;
-    const int bidh = blockIdx.y;
     const int partition_idx = blockIdx.z;
     const int warpgroup_idx = cutlass::canonical_warp_group_idx();
     const int idx_in_warpgroup = threadIdx.x % 128;
@@ -238,7 +237,7 @@ flash_fwd_splitkv_mla_dense_kernel(__grid_constant__ const DecodingParams params
             auto [seqlen_k, start_block_idx, end_block_idx, is_no_split] = get_cur_req_info(batch_idx);
 
             int *block_table = params.block_table + batch_idx * params.block_table_batch_stride;
-            const index_t row_offset_k = bidh * params.k_head_stride;
+            const index_t row_offset_k = head_block_idx * params.k_head_stride;
             Tensor gK = make_tensor(make_gmem_ptr(reinterpret_cast<bf16 *>(params.k_ptr) + row_offset_k),
                                     Shape<Int<B_TOPK>, Int<D_K>>{},
                                     make_stride(params.k_row_stride, _1{}));
@@ -569,27 +568,27 @@ flash_fwd_splitkv_mla_dense_kernel(__grid_constant__ const DecodingParams params
 void run_flash_splitkv_mla_dense_kernel(DecodingParams &params, cudaStream_t stream) {
     FLASH_ASSERT(params.h_k == 1);
 
-    auto shape_Q = make_shape(params.q_head_per_hk, params.d, params.s_q, params.b);
+    auto shape_Q = make_shape(params.q_head_per_hk * params.h_k, params.d, params.s_q, params.b);
     auto tma_Q = cute::make_tma_copy(
         SM90_TMA_LOAD{},
         make_tensor(
             make_gmem_ptr((bf16*)params.q_ptr),
             make_layout(
                 shape_Q,
-                make_stride(params.q_row_stride, _1{}, params.q_head_per_hk*params.q_row_stride, params.q_batch_stride)
+                make_stride(params.q_head_stride, _1{}, params.q_head_per_hk*params.q_row_stride, params.q_batch_stride)
             )
         ),
         SmemLayoutQ{}
     );
 
-    auto shape_O = make_shape(params.q_head_per_hk, params.d_v, params.s_q, params.b);
+    auto shape_O = make_shape(params.q_head_per_hk * params.h_k, params.d_v, params.s_q, params.b);
     auto tma_O = cute::make_tma_copy(
         SM90_TMA_STORE{},
         make_tensor(
             make_gmem_ptr((bf16*)params.o_ptr),
             make_layout(
                 shape_O,
-                make_stride(params.o_row_stride, _1{}, params.q_head_per_hk*params.o_row_stride, params.o_batch_stride)
+                make_stride(params.o_head_stride, _1{}, params.q_head_per_hk*params.o_row_stride, params.o_batch_stride)
             )
         ),
         SmemLayoutOBuf{}
@@ -607,7 +606,7 @@ void run_flash_splitkv_mla_dense_kernel(DecodingParams &params, cudaStream_t str
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     CHECK_CUDA(cudaFuncSetAttribute(mla_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
-    const int num_m_blocks = cute::ceil_div(params.q_head_per_hk, B_H);
+    const int num_m_blocks = cute::ceil_div(params.q_head_per_hk * params.h_k, B_H);
     // NOTE Don't use PDL because of potential compiler bugs!
     mla_kernel<<<dim3(num_m_blocks, params.s_q, params.num_sm_parts), dim3(NUM_THREADS, 1, 1), smem_size, stream>>>(params, tma_params);
     CHECK_CUDA_KERNEL_LAUNCH();
