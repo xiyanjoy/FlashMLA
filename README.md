@@ -78,14 +78,16 @@ For the NVIDIA platform:
 
 - NVIDIA SM100 / SM103 GPU
 - CUDA 13.1 and above (CUDA 13.2 and above is recommended, since it provides the native `cvt.rn.bf16x2` conversions that the quantized decoding kernels use; on CUDA 13.1 they fall back to a slower widening through FP32)
-- PyTorch 2.0 and above
+- PyTorch 2.10 and above
 
 For the Huawei platform:
 
 - Huawei Ascend 950 NPU
 - CANN 9.2.0 and above (provides the `bisheng` compiler and the Ascend C headers used at build time)
 - `torch_npu`
-- PyTorch 2.0 and above
+- PyTorch 2.10 and above
+
+FlashMLA CUDA wheels use PyTorch's Stable C++ ABI and CPython's Limited API (`abi3`, minimum CPython 3.10). A CUDA wheel built once can therefore be used with PyTorch 2.10+ and CPython 3.10+ without recompilation, subject to the GPU architectures compiled into it. On the Ascend platform, however, the wheel obtains the native device stream through an Ascend-only `torch_npu` bridge, and must therefore be built for a `torch_npu` version compatible with the installed PyTorch.
 
 ## Installation
 
